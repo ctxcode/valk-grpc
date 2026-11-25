@@ -1,0 +1,342 @@
+use valk.time
+use valk.core
+use valk.fs
+use valk.sync
+use grpc
+
+fn start_test_server() (grpc.GrpcServer, u16) {
+    let srv = grpc.GrpcServer.new("127.0.0.1", 0)
+
+    // Unary echo with metadata + headers + trailers + optional gzip response
+    srv.register_unary("/test.Echo/Say", fn(ctx: grpc.CallContext, req: String) String !grpc.GrpcError {
+        let req_id = ctx.metadata.get("x-req-id") ?? ""
+        if req_id.bytes > 0 : ctx.set_header("x-resp-id", "ack-" + req_id)
+        let bin = ctx.metadata.get_bin("x-trace-bin") !? null
+        if isset(bin) : ctx.response_trailers.set_bin("x-trace-out-bin", bin + ":ok")
+        ctx.set_trailer("x-trailer-note", "done")
+        if (ctx.metadata.get("x-reply-gzip") ?? "") == "1" {
+            ctx.compression = .gzip
+        }
+        return "echo:" + req
+    })
+
+    // Unary returning custom error + UTF-8 message + binary details
+    srv.register_unary("/test.Echo/Fail", fn(ctx: grpc.CallContext, req: String) String !grpc.GrpcError {
+        let _ = req
+        ctx.set_trailer("x-err-source", "server")
+        throw grpc.err(.permission_denied, "denied for café: 100%", "\x01\x02\x03")
+    })
+
+    // Slow unary for deadline testing
+    srv.register_unary("/test.Echo/Slow", fn(ctx: grpc.CallContext, req: String) String !grpc.GrpcError {
+        let _ = req
+        let i: uint = 0
+        while i < 40 {
+            if ctx.is_expired() : throw grpc.err(.deadline_exceeded, "server deadline hit")
+            time.sleep_ms(10)
+            i++
+        }
+        return "too-late"
+    })
+
+    // Server streaming
+    srv.register_server_stream("/test.Echo/StreamOut", fn(ctx: grpc.CallContext, req: String, stream: grpc.ServerStream) void !grpc.GrpcError {
+        ctx.set_header("x-stream-kind", "server")
+        stream.set_trailer("x-count", "4")
+        let i: uint = 0
+        while i < 4 {
+            stream.send("%{req}-%{i}") !>
+            i++
+        }
+    })
+
+    // Server streaming that fails mid-stream (tests dynamic trailer status after DATA frames)
+    srv.register_server_stream("/test.Echo/StreamFailMid", fn(ctx: grpc.CallContext, req: String, stream: grpc.ServerStream) void !grpc.GrpcError {
+        let _ = ctx
+        let _ = req
+        stream.send("chunk-0") !>
+        stream.send("chunk-1") !>
+        throw grpc.err(.aborted, "stream aborted mid-way")
+    })
+
+    // Client streaming
+    srv.register_client_stream("/test.Echo/StreamIn", fn(stream: grpc.ServerStream) String !grpc.GrpcError {
+        let parts = Array[String]{}
+        while true {
+            let msg = (stream.recv() !>) ?! break
+            parts.append(msg)
+        }
+        stream.set_trailer("x-received", parts.length.to_string())
+        return parts.join("|")
+    })
+
+    // Full-duplex bidirectional streaming
+    srv.register_bidi_stream("/test.Echo/Chat", fn(stream: grpc.ServerStream) void !grpc.GrpcError {
+        stream.send_header() !>
+        while true {
+            let msg = (stream.recv() !>) ?! break
+            stream.send("bidi:" + msg) !>
+        }
+        stream.set_trailer("x-chat", "closed")
+    })
+
+    let port = srv.bind() ! panic("Failed to bind test gRPC server: %{E}")
+    co srv.start()
+    return (srv, port)
+}
+
+test "Unary RPC, metadata, -bin headers, trailers, and large flow-control payload over h2c" {
+    let srv, port = start_test_server()
+    defer srv.shutdown(1000)
+
+    let client = grpc.GrpcClient.connect("127.0.0.1:%{port}") ! { assert(false) return }
+    defer client.close()
+
+    let opts = grpc.CallOptions {}
+    opts.set_header("x-req-id", "42")
+    opts.set_bin_header("x-trace-bin", "\x00\xab\xcd")
+
+    let resp = client.unary("/test.Echo/Say", "hello", opts) ! { assert(false) return }
+    assert(resp.body == "echo:hello")
+    assert((resp.headers.get("x-resp-id") ?? "") == "ack-42")
+    assert((resp.trailers.get("x-trailer-note") ?? "") == "done")
+    let out_bin = (resp.trailers.get_bin("x-trace-out-bin") ! { assert(false) return }) ?? ""
+    assert(out_bin == "\x00\xab\xcd:ok")
+
+    // Empty message round-trip
+    let empty_resp = client.unary("/test.Echo/Say", "") ! { assert(false) return }
+    assert(empty_resp.body == "echo:")
+
+    // Large payload (> 128 KiB) exercises HTTP/2 multi-frame DATA + WINDOW_UPDATE flow control
+    let large = "A".repeat(150_000)
+    let large_resp = client.unary("/test.Echo/Say", large) ! { assert(false) return }
+    assert(large_resp.body == "echo:" + large)
+}
+
+test "Server streaming, mid-stream error, client streaming, and true full-duplex bidi streaming" {
+    let srv, port = start_test_server()
+    defer srv.shutdown(1000)
+
+    let client = grpc.GrpcClient.connect("http://127.0.0.1:%{port}") ! { assert(false) return }
+    defer client.close()
+
+    // 1. Server streaming
+    let ss = client.server_stream("/test.Echo/StreamOut", "item") ! { assert(false) return }
+    let sh = ss.headers() ! { assert(false) return }
+    assert((sh.get("x-stream-kind") ?? "") == "server")
+    let received = Array[String]{}
+    while true {
+        let msg = (ss.recv() ! { assert(false) return }) ?! break
+        received.append(msg)
+    }
+    assert(received.length == 4)
+    assert((received.get(0) !? "") == "item-0")
+    assert((received.get(3) !? "") == "item-3")
+    assert((ss.trailers().get("x-count") ?? "") == "4")
+
+    // 2. Server streaming with mid-stream error in trailers
+    let sfail = client.server_stream("/test.Echo/StreamFailMid", "go") ! { assert(false) return }
+    let m0 = (sfail.recv() ! { assert(false) return }) ?? ""
+    let m1 = (sfail.recv() ! { assert(false) return }) ?? ""
+    assert(m0 == "chunk-0")
+    assert(m1 == "chunk-1")
+    let got_aborted = false
+    sfail.recv() ! {
+        got_aborted = E.code == grpc.StatusCode.aborted && E.message == "stream aborted mid-way"
+    }
+    assert(got_aborted)
+
+    // 3. Client streaming
+    let cs = client.client_stream("/test.Echo/StreamIn") ! { assert(false) return }
+    cs.send("alpha") ! { assert(false) return }
+    cs.send("beta") ! { assert(false) return }
+    cs.send("gamma") ! { assert(false) return }
+    let cbody, ctrailers = cs.finish() ! { assert(false) return }
+    assert(cbody == "alpha|beta|gamma")
+    assert((ctrailers.get("x-received") ?? "") == "3")
+
+    // 4. True full-duplex bidirectional streaming (interleaved send/recv BEFORE close_send)
+    let bs = client.bidi_stream("/test.Echo/Chat") ! { assert(false) return }
+    let i: uint = 0
+    while i < 5 {
+        bs.send("ping-%{i}") ! { assert(false) return }
+        let reply = (bs.recv() ! { assert(false) return }) ?? ""
+        assert(reply == "bidi:ping-%{i}")
+        i++
+    }
+    bs.close_send() ! { assert(false) return }
+    let eof = bs.recv() ! { assert(false) return }
+    assert(!isset(eof))
+    assert((bs.trailers().get("x-chat") ?? "") == "closed")
+}
+
+test "Error propagation via trailers-only, unknown method UNIMPLEMENTED, deadline exceeded, gzip, and max message size" {
+    let srv, port = start_test_server()
+    srv.max_recv_message_size = 1024
+    defer srv.shutdown(1000)
+
+    let client = grpc.GrpcClient.connect("127.0.0.1:%{port}") ! { assert(false) return }
+    defer client.close()
+
+    // 1. Trailers-only error with percent-encoded UTF-8 message and binary details
+    let err_ok = false
+    client.unary("/test.Echo/Fail", "x") ! {
+        err_ok = E.code == grpc.StatusCode.permission_denied
+            && E.message == "denied for café: 100%"
+            && E.details == "\x01\x02\x03"
+    }
+    assert(err_ok)
+
+    // 2. Unknown method -> UNIMPLEMENTED (trailers-only)
+    let unimpl_ok = false
+    client.unary("/test.Unknown/Nope", "") ! {
+        unimpl_ok = E.code == grpc.StatusCode.unimplemented
+    }
+    assert(unimpl_ok)
+
+    // 3. Deadline exceeded
+    let deadline_ok = false
+    client.unary("/test.Echo/Slow", "x", grpc.CallOptions { timeout_ms: 80 }) ! {
+        deadline_ok = E.code == grpc.StatusCode.deadline_exceeded
+    }
+    assert(deadline_ok)
+
+    // 4. Gzip compression both directions (request gzip + response gzip)
+    let gz_opts = grpc.CallOptions { compression: .gzip }
+    gz_opts.set_header("x-reply-gzip", "1")
+    let payload = "compressible payload ".repeat(20)
+    let gz_resp = client.unary("/test.Echo/Say", payload, gz_opts) ! { assert(false) return }
+    assert(gz_resp.body == "echo:" + payload)
+
+    // 5. Max message size enforcement -> RESOURCE_EXHAUSTED (server rejects > 1024 bytes)
+    let oversized = "Z".repeat(2048)
+    let srv_limit_ok = false
+    client.unary("/test.Echo/Say", oversized) ! {
+        srv_limit_ok = E.code == grpc.StatusCode.resource_exhausted
+    }
+    assert(srv_limit_ok)
+
+    // Client-side max_send_size enforcement
+    let cli_limit_ok = false
+    client.unary("/test.Echo/Say", "1234567890", grpc.CallOptions { max_send_size: 4 }) ! {
+        cli_limit_ok = E.code == grpc.StatusCode.resource_exhausted
+    }
+    assert(cli_limit_ok)
+}
+
+test "Concurrent multiplexed RPCs over a single HTTP/2 connection and server interceptors" {
+    let srv = grpc.GrpcServer.new("127.0.0.1", 0)
+    srv.add_unary_interceptor(fn(ctx: grpc.CallContext, req: String, next: grpc.UnaryHandler) String !grpc.GrpcError {
+        let token = ctx.metadata.get("authorization") ?? ""
+        if token != "Bearer secret" : throw grpc.err(.unauthenticated, "missing or invalid token")
+        ctx.set_header("x-intercepted", "yes")
+        return next(ctx, req) !>
+    })
+    srv.register_unary("/test.Auth/WhoAmI", fn(ctx: grpc.CallContext, req: String) String !grpc.GrpcError {
+        let _ = ctx
+        return "ok:" + req
+    })
+
+    let port = srv.bind() ! { assert(false) return }
+    co srv.start()
+    defer srv.shutdown(1000)
+
+    let client = grpc.GrpcClient.connect("127.0.0.1:%{port}") ! { assert(false) return }
+    defer client.close()
+
+    // Unauthenticated call rejected by interceptor
+    let unauth_ok = false
+    client.unary("/test.Auth/WhoAmI", "alice") ! {
+        unauth_ok = E.code == grpc.StatusCode.unauthenticated
+    }
+    assert(unauth_ok)
+
+    // 8 concurrent multiplexed unary calls on the same HTTP/2 connection
+    let wg = sync.WaitGroup.new() ! { assert(false) return }
+    let passed = Array[bool]{}
+    let i: uint = 0
+    while i < 8 {
+        let idx = i
+        wg.add(1)
+        co fn() {
+            defer wg.done()
+            let opts = grpc.CallOptions {}
+            opts.set_header("authorization", "Bearer secret")
+            let resp = client.unary("/test.Auth/WhoAmI", "user-%{idx}", opts) ! return
+            if resp.body == "ok:user-%{idx}" && (resp.headers.get("x-intercepted") ?? "") == "yes" {
+                passed.append(true)
+            }
+        }()
+        i++
+    }
+    wg.wait() ! { assert(false) return }
+    assert(passed.length == 8)
+}
+
+test "End-to-end gRPC over TLS with ALPN h2" {
+    let tmp_dir = "tests/tmp/tls_h2"
+    fs.create_dir_all(tmp_dir) ! { assert(false) return }
+    defer fs.delete_all(tmp_dir) _
+
+    let cert_path = "%{tmp_dir}/cert.pem"
+    let key_path = "%{tmp_dir}/key.pem"
+    let rc, _ = core.exec("openssl req -x509 -newkey rsa:2048 -keyout %{key_path} -out %{cert_path} -days 1 -nodes -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1,DNS:localhost 2>/dev/null")
+    assert(rc == 0)
+
+    let srv = grpc.GrpcServer.new("127.0.0.1", 0)
+    srv.tls(cert_path, key_path) ! { assert(false) return }
+    srv.register_unary("/test.Tls/Ping", fn(ctx: grpc.CallContext, req: String) String !grpc.GrpcError {
+        let _ = ctx
+        return "tls:" + req
+    })
+    let port = srv.bind() ! { assert(false) return }
+    co srv.start()
+    defer srv.shutdown(1000)
+
+    let copts = grpc.ClientOptions {
+        tls: true
+        verify_tls: true
+        ca_cert_path: cert_path
+    }
+    let client = grpc.GrpcClient.connect("https://127.0.0.1:%{port}", copts) ! { assert(false) return }
+    defer client.close()
+
+    let resp = client.unary("/test.Tls/Ping", "secure") ! { assert(false) return }
+    assert(resp.body == "tls:secure")
+}
+
+test "Stream interceptor and client stream cancellation" {
+    let srv = grpc.GrpcServer.new("127.0.0.1", 0)
+    srv.add_stream_interceptor(fn(stream: grpc.ServerStream, next: grpc.BidiStreamHandler) void !grpc.GrpcError {
+        stream.ctx.set_header("x-stream-ic", "active")
+        next(stream) !>
+    })
+    srv.register_bidi_stream("/test.Cancel/Hold", fn(stream: grpc.ServerStream) void !grpc.GrpcError {
+        stream.send_header() !>
+        while true {
+            let msg = (stream.recv() !>) ?! break
+            stream.send("got:" + msg) !>
+        }
+    })
+    let port = srv.bind() ! { assert(false) return }
+    co srv.start()
+    defer srv.shutdown(1000)
+
+    let client = grpc.GrpcClient.connect("127.0.0.1:%{port}") ! { assert(false) return }
+    defer client.close()
+
+    let bs = client.bidi_stream("/test.Cancel/Hold") ! { assert(false) return }
+    let hdrs = bs.headers() ! { assert(false) return }
+    assert((hdrs.get("x-stream-ic") ?? "") == "active")
+
+    bs.send("hello") ! { assert(false) return }
+    let got = (bs.recv() ! { assert(false) return }) ?? ""
+    assert(got == "got:hello")
+
+    bs.cancel()
+    let cancelled_ok = false
+    bs.recv() ! {
+        cancelled_ok = E.code == grpc.StatusCode.cancelled
+    }
+    assert(cancelled_ok)
+}

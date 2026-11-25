@@ -1,0 +1,170 @@
+use grpc
+
+test "StatusCode enum values, names, and HTTP mapping" {
+    assert(grpc.StatusCode.ok.to(i32) == 0)
+    assert(grpc.StatusCode.unauthenticated.to(i32) == 16)
+    assert(grpc.StatusCode.not_found.status_name() == "NOT_FOUND")
+    assert(grpc.StatusCode.resource_exhausted.status_name() == "RESOURCE_EXHAUSTED")
+    assert(grpc.status_code_from_int(0) == grpc.StatusCode.ok)
+    assert(grpc.status_code_from_int(12) == grpc.StatusCode.unimplemented)
+    assert(grpc.status_code_from_int(999) == grpc.StatusCode.unknown)
+    assert(grpc.status_code_from_http(400) == grpc.StatusCode.internal)
+    assert(grpc.status_code_from_http(401) == grpc.StatusCode.unauthenticated)
+    assert(grpc.status_code_from_http(403) == grpc.StatusCode.permission_denied)
+    assert(grpc.status_code_from_http(404) == grpc.StatusCode.unimplemented)
+    assert(grpc.status_code_from_http(503) == grpc.StatusCode.unavailable)
+}
+
+test "GrpcError union properties, to_string, and details" {
+    let e = grpc.err(.not_found, "user 42 missing", "\x08\x05")
+    assert(e.code == grpc.StatusCode.not_found)
+    assert(e.message == "user 42 missing")
+    assert(e.details == "\x08\x05")
+    let s: String = e
+    assert(s == "NOT_FOUND: user 42 missing")
+
+    let empty_msg = grpc.err(.unimplemented)
+    let s2: String = empty_msg
+    assert(s2 == "UNIMPLEMENTED")
+
+    let matched = match e : bool {
+        .not_found(m, d) => m == "user 42 missing" && d == "\x08\x05"
+        default => false
+    }
+    assert(matched)
+}
+
+test "Metadata case-insensitivity, multi-values, and binary -bin base64 headers" {
+    let md = grpc.Metadata.new()
+    md.set("X-Request-Id", "abc-123")
+    md.append("X-Tag", "one")
+    md.append("x-tag", "two")
+    assert(md.length == 3)
+    assert((md.get("x-request-id") ?? "") == "abc-123")
+    assert(md.has("X-REQUEST-ID"))
+
+    let tags = md.get_all("X-Tag")
+    assert(tags.length == 2)
+    assert((tags.get(0) !? "") == "one")
+    assert((tags.get(1) !? "") == "two")
+
+    // Binary metadata
+    let raw_bin = "\x00\x01\x02\xffbinary\xfe"
+    md.set_bin("trace-bin", raw_bin)
+    let got_bin = (md.get_bin("TRACE-BIN") ! { assert(false) return }) ?? ""
+    assert(got_bin == raw_bin)
+
+    // Auto-appends -bin suffix
+    md.append_bin("payload", "part1")
+    md.append_bin("payload-bin", "part2")
+    let all_bin = md.get_all_bin("payload-bin") ! { assert(false) return }
+    assert(all_bin.length == 2)
+    assert((all_bin.get(0) !? "") == "part1")
+    assert((all_bin.get(1) !? "") == "part2")
+
+    // Invalid base64 fails cleanly
+    md.set("bad-bin", "!!!not-base64!!!")
+    let bad_ok = false
+    md.get_bin("bad-bin") ! {
+        bad_ok = E.code == grpc.StatusCode.internal
+    }
+    assert(bad_ok)
+
+    md.remove("x-tag")
+    assert(!md.has("x-tag"))
+}
+
+test "Percent encoding and decoding for grpc-message" {
+    let original = "hello world! 100% done\nline2 café 🚀"
+    let encoded = grpc.percent_encode(original)
+    assert(encoded.contains("%25"))
+    assert(encoded.contains("%0A"))
+    assert(!encoded.contains("\n"))
+    let decoded = grpc.percent_decode(encoded)
+    assert(decoded == original)
+
+    // Plain ASCII stays unchanged
+    assert(grpc.percent_encode("simple ASCII message") == "simple ASCII message")
+    assert(grpc.percent_decode("simple ASCII message") == "simple ASCII message")
+}
+
+test "gRPC timeout formatting and parsing" {
+    assert(grpc.format_timeout_ms(250) == "250m")
+    assert(grpc.format_timeout_ms(5000) == "5000m")
+    assert((grpc.parse_timeout_ms("250m") !? 0) == 250)
+    assert((grpc.parse_timeout_ms("3S") !? 0) == 3000)
+    assert((grpc.parse_timeout_ms("2M") !? 0) == 120_000)
+    assert((grpc.parse_timeout_ms("1H") !? 0) == 3_600_000)
+    assert((grpc.parse_timeout_ms("1500u") !? 0) == 2)
+    assert((grpc.parse_timeout_ms("2500000n") !? 0) == 3)
+
+    let invalid_failed = false
+    grpc.parse_timeout_ms("10X") ! {
+        invalid_failed = E.code == grpc.StatusCode.invalid_argument
+    }
+    assert(invalid_failed)
+}
+
+test "Length-prefixed framing, gzip compression, streaming reassembly, and max size" {
+    let payload = "hello gRPC framing " + "repeating data ".repeat(100)
+    let raw_frame = grpc.encode_frame(payload, .identity) ! { assert(false) return }
+    assert(raw_frame.bytes == 5 + payload.bytes)
+    assert(raw_frame[0] == 0)
+
+    let dec = (grpc.decode_frame(raw_frame, .identity) ! { assert(false) return }) ?! { assert(false) return }
+    let msg, consumed = dec
+    assert(msg == payload)
+    assert(consumed == raw_frame.bytes)
+
+    // Gzip compressed frame
+    let gz_frame = grpc.encode_frame(payload, .gzip) ! { assert(false) return }
+    assert(gz_frame[0] == 1)
+    assert(gz_frame.bytes < raw_frame.bytes)
+
+    let gz_dec = (grpc.decode_frame(gz_frame, .gzip) ! { assert(false) return }) ?! { assert(false) return }
+    let gz_msg, gz_consumed = gz_dec
+    assert(gz_msg == payload)
+    assert(gz_consumed == gz_frame.bytes)
+
+    // Compressed frame without gzip encoding rejected
+    let comp_err = false
+    grpc.decode_frame(gz_frame, .identity) ! {
+        comp_err = E.code == grpc.StatusCode.internal
+    }
+    assert(comp_err)
+
+    // Streaming reassembly across tiny 3-byte chunks (two frames back-to-back)
+    let f1 = grpc.encode_frame("first", .identity) ! { assert(false) return }
+    let f2 = grpc.encode_frame("second", .identity) ! { assert(false) return }
+    let combined = f1 + f2
+    let fdec = grpc.FrameDecoder.new(.identity)
+    let got = Array[String]{}
+    let pos: uint = 0
+    while pos < combined.bytes {
+        let take: uint = (combined.bytes - pos) < 3 ? (combined.bytes - pos) : 3
+        fdec.push(combined.range(pos, take))
+        pos += take
+        while true {
+            let m = (fdec.next() ! { assert(false) return }) ?! break
+            got.append(m)
+        }
+    }
+    assert(!fdec.has_partial())
+    assert(got.length == 2)
+    assert((got.get(0) !? "") == "first")
+    assert((got.get(1) !? "") == "second")
+
+    // Max message size enforcement -> RESOURCE_EXHAUSTED
+    let send_too_big = false
+    grpc.encode_frame("1234567890", .identity, 5) ! {
+        send_too_big = E.code == grpc.StatusCode.resource_exhausted
+    }
+    assert(send_too_big)
+
+    let recv_too_big = false
+    let big_frame = grpc.encode_frame("1234567890", .identity, 100) ! { assert(false) return }
+    grpc.decode_frame(big_frame, .identity, 5) ! {
+        recv_too_big = E.code == grpc.StatusCode.resource_exhausted
+    }
+    assert(recv_too_big)
+}

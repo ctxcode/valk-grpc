@@ -1,0 +1,35 @@
+use grpc
+
+fn main() {
+    let srv = grpc.GrpcServer.new("127.0.0.1", 0)
+
+    srv.register_unary("/demo.Greeter/SayHello", fn(ctx: grpc.CallContext, req: String) String !grpc.GrpcError {
+        ctx.set_header("x-server", "valk-grpc")
+        ctx.set_trailer("x-served-by", "demo")
+        return "Hello, %{req}!"
+    })
+
+    srv.register_bidi_stream("/demo.Greeter/Chat", fn(stream: grpc.ServerStream) void !grpc.GrpcError {
+        while true {
+            let msg = (stream.recv() !>) ?! break
+            stream.send("echo: %{msg}") !>
+        }
+    })
+
+    let port = srv.bind() ! panic("Bind failed: %{E}")
+    co srv.start()
+    defer srv.shutdown(1000)
+
+    let client = grpc.GrpcClient.connect("127.0.0.1:%{port}") ! panic("Connect failed: %{E}")
+    defer client.close()
+
+    let res = client.unary("/demo.Greeter/SayHello", "Valk") ! panic("Unary failed: %{E}")
+    println("Unary reply: %{res.body} (trailer x-served-by=%{res.trailers.get("x-served-by") ?? ""})")
+
+    let chat = client.bidi_stream("/demo.Greeter/Chat") ! panic("Bidi failed: %{E}")
+    chat.send("ping") ! panic("Send failed: %{E}")
+    let reply = (chat.recv() ! panic("Recv failed: %{E}")) ?? ""
+    println("Bidi reply: %{reply}")
+    chat.close_send() ! panic("Close send failed: %{E}")
+    let _ = chat.recv() ! panic("EOF check failed: %{E}")
+}

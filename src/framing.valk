@@ -1,0 +1,141 @@
+use valk.compress
+
+/// Default maximum gRPC message size (4 MiB).
++ value DEFAULT_MAX_MESSAGE_SIZE (4 * 1024 * 1024)
+
+/// gRPC message compression algorithm.
++ enum Compression: u8 {
+    identity (0)
+    gzip (1)
+}
+
+/// Returns the wire `grpc-encoding` header name (`"identity"` or `"gzip"`).
++ fn compression_name(c: Compression) String {
+    return match c : String {
+        .identity => "identity"
+        .gzip => "gzip"
+    }
+}
+
+/// Parses a `grpc-encoding` header value into `Compression`.
+/// Throws `StatusCode.unimplemented` for unsupported encodings per gRPC spec.
++ fn compression_from_name(name: String) Compression !GrpcError {
+    let lower = name.trim().lower()
+    if lower.bytes == 0 || lower == "identity" : return .identity
+    if lower == "gzip" : return .gzip
+    throw err(.unimplemented, "Unsupported grpc-encoding: %{name}")
+}
+
+/// Returns true if a `grpc-accept-encoding` header list includes `gzip`.
++ fn accepts_gzip(accept_encoding: String) bool {
+    let parts = accept_encoding.split(",")
+    each parts as part {
+        if part.trim().lower() == "gzip" : return true
+    }
+    return false
+}
+
+/// Encodes `payload` into a 5-byte length-prefixed gRPC message frame.
+///
+/// Format: `[compressed: u8][length: u32 big-endian][bytes...]`.
+/// Throws `StatusCode.resource_exhausted` when the payload exceeds `max_size`.
++ fn encode_frame(payload: local &[u8], compression: Compression (.identity), max_size: uint (DEFAULT_MAX_MESSAGE_SIZE)) String !GrpcError {
+    if max_size > 0 && payload.length > max_size {
+        throw err(.resource_exhausted, "Outgoing message size %{payload.length} exceeds limit %{max_size}")
+    }
+    let compressed_flag: u8 = 0
+    let body_bytes = ""
+    let use_compressed = false
+    if compression == .gzip {
+        body_bytes = compress.gzip(payload)
+        compressed_flag = 1
+        use_compressed = true
+        if max_size > 0 && body_bytes.bytes > max_size {
+            throw err(.resource_exhausted, "Compressed message size %{body_bytes.bytes} exceeds limit %{max_size}")
+        }
+    }
+    let body_len = use_compressed ? body_bytes.bytes : payload.length
+    if body_len > 0xffffffff {
+        throw err(.resource_exhausted, "Message length exceeds 32-bit gRPC frame limit")
+    }
+    let out = ByteBuffer.new(5 + body_len)
+    out.write_byte(compressed_flag)
+    out.write_u32_be(body_len.to(u32))
+    if use_compressed {
+        if body_bytes.bytes > 0 : out.write(body_bytes)
+    } else {
+        if payload.length > 0 : out.write(payload)
+    }
+    return out.into_string()
+}
+
+/// Decodes one complete length-prefixed gRPC message from `data`.
+///
+/// Returns `(payload, bytes_consumed)` or `null` if `data` does not yet contain a full frame.
++ fn decode_frame(data: local &[u8], compression: Compression (.identity), max_size: uint (DEFAULT_MAX_MESSAGE_SIZE)) ?(String, uint) !GrpcError {
+    if data.length < 5 : return null
+    let flag = data[0]
+    if flag != 0 && flag != 1 {
+        throw err(.internal, "Invalid gRPC compressed flag: %{flag}")
+    }
+    let msg_len: uint = (data[1].to(uint) << 24)
+        | (data[2].to(uint) << 16)
+        | (data[3].to(uint) << 8)
+        | data[4].to(uint)
+    if max_size > 0 && msg_len > max_size {
+        throw err(.resource_exhausted, "Received message size %{msg_len} exceeds limit %{max_size}")
+    }
+    if data.length - 5 < msg_len : return null
+
+    let raw = data.view(5, msg_len)
+    if flag == 0 {
+        return (raw.to_string(), 5 + msg_len)
+    }
+    if compression == .identity {
+        throw err(.internal, "Received compressed gRPC frame without grpc-encoding")
+    }
+    let decompressed = compress.gunzip(raw, max_size) ! {
+        if E == .too_large {
+            throw err(.resource_exhausted, "Decompressed message exceeds limit %{max_size}")
+        }
+        throw err(.internal, "Failed to gunzip gRPC message")
+    }
+    return (decompressed, 5 + msg_len)
+}
+
+/// Incremental buffer that reassembles length-prefixed gRPC messages across HTTP/2 DATA frames.
++ class FrameDecoder {
+    - buf: ByteBuffer (.new(0))
+    + compression: Compression (.identity)
+    + max_size: uint (DEFAULT_MAX_MESSAGE_SIZE)
+
+    + static fn new(compression: Compression (.identity), max_size: uint (DEFAULT_MAX_MESSAGE_SIZE)) SELF {
+        return SELF {
+            buf: ByteBuffer.new(0)
+            compression: compression
+            max_size: max_size
+        }
+    }
+
+    /// Appends raw HTTP/2 DATA bytes into the decoder buffer.
+    + fn push(chunk: local &[u8]) {
+        if chunk.length > 0 : this.buf.write(chunk)
+    }
+
+    /// Extracts the next complete message, or returns `null` if more bytes are needed.
+    + fn next() ?String !GrpcError {
+        let decoded = decode_frame(this.buf.view(), this.compression, this.max_size) !>
+        let pair = decoded ?! return null
+        let msg, consumed = pair
+        this.buf.clear_until(consumed)
+        if this.buf.length == 0 && this.buf.size > 65_536 {
+            this.buf.shrink_capacity(4096)
+        }
+        return msg
+    }
+
+    /// Returns true if buffered undecoded bytes remain (indicates truncation at EOF).
+    + fn has_partial() bool {
+        return this.buf.length > 0
+    }
+}

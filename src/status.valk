@@ -1,0 +1,205 @@
+/// Standard gRPC status codes (0 through 16).
++ enum StatusCode: i32 {
+    ok (0)
+    cancelled (1)
+    unknown (2)
+    invalid_argument (3)
+    deadline_exceeded (4)
+    not_found (5)
+    already_exists (6)
+    permission_denied (7)
+    resource_exhausted (8)
+    failed_precondition (9)
+    aborted (10)
+    out_of_range (11)
+    unimplemented (12)
+    internal (13)
+    unavailable (14)
+    data_loss (15)
+    unauthenticated (16)
+}
+
+extend StatusCode {
+    /// Returns the canonical uppercase gRPC status name (e.g. `"NOT_FOUND"`).
+    + fn status_name() String {
+        return match this : String {
+            .ok => "OK"
+            .cancelled => "CANCELLED"
+            .unknown => "UNKNOWN"
+            .invalid_argument => "INVALID_ARGUMENT"
+            .deadline_exceeded => "DEADLINE_EXCEEDED"
+            .not_found => "NOT_FOUND"
+            .already_exists => "ALREADY_EXISTS"
+            .permission_denied => "PERMISSION_DENIED"
+            .resource_exhausted => "RESOURCE_EXHAUSTED"
+            .failed_precondition => "FAILED_PRECONDITION"
+            .aborted => "ABORTED"
+            .out_of_range => "OUT_OF_RANGE"
+            .unimplemented => "UNIMPLEMENTED"
+            .internal => "INTERNAL"
+            .unavailable => "UNAVAILABLE"
+            .data_loss => "DATA_LOSS"
+            .unauthenticated => "UNAUTHENTICATED"
+        }
+    }
+}
+
+/// Converts a raw numeric gRPC status code into `StatusCode`.
+/// Out-of-range values map to `StatusCode.unknown`.
++ fn status_code_from_int(code: i32) StatusCode {
+    return match code : StatusCode {
+        0 => .ok
+        1 => .cancelled
+        2 => .unknown
+        3 => .invalid_argument
+        4 => .deadline_exceeded
+        5 => .not_found
+        6 => .already_exists
+        7 => .permission_denied
+        8 => .resource_exhausted
+        9 => .failed_precondition
+        10 => .aborted
+        11 => .out_of_range
+        12 => .unimplemented
+        13 => .internal
+        14 => .unavailable
+        15 => .data_loss
+        16 => .unauthenticated
+        default => .unknown
+    }
+}
+
+/// Maps an HTTP status code to a gRPC `StatusCode` per the gRPC HTTP/2 specification.
++ fn status_code_from_http(http_status: u16) StatusCode {
+    return match http_status : StatusCode {
+        400 => .internal
+        401 => .unauthenticated
+        403 => .permission_denied
+        404 => .unimplemented
+        429, 502, 503, 504 => .unavailable
+        default => .unknown
+    }
+}
+
+/// Error thrown by gRPC calls, servers, codecs, and transport operations.
+///
+/// Each variant corresponds to a non-OK gRPC status code and carries `(message, details)`
+/// where `details` holds optional raw bytes (such as serialized `grpc-status-details-bin`).
++ union GrpcError {
+    cancelled(String, String)
+    unknown(String, String)
+    invalid_argument(String, String)
+    deadline_exceeded(String, String)
+    not_found(String, String)
+    already_exists(String, String)
+    permission_denied(String, String)
+    resource_exhausted(String, String)
+    failed_precondition(String, String)
+    aborted(String, String)
+    out_of_range(String, String)
+    unimplemented(String, String)
+    internal(String, String)
+    unavailable(String, String)
+    data_loss(String, String)
+    unauthenticated(String, String)
+
+    /// Creates a `GrpcError` for `code`, `message`, and optional binary `details`.
+    /// Passing `StatusCode.ok` produces `.unknown`.
+    + static fn from_status(code: StatusCode, message: String (""), details: String ("")) GrpcError {
+        return match code : GrpcError {
+            .cancelled => .cancelled(message, details)
+            .invalid_argument => .invalid_argument(message, details)
+            .deadline_exceeded => .deadline_exceeded(message, details)
+            .not_found => .not_found(message, details)
+            .already_exists => .already_exists(message, details)
+            .permission_denied => .permission_denied(message, details)
+            .resource_exhausted => .resource_exhausted(message, details)
+            .failed_precondition => .failed_precondition(message, details)
+            .aborted => .aborted(message, details)
+            .out_of_range => .out_of_range(message, details)
+            .unimplemented => .unimplemented(message, details)
+            .internal => .internal(message, details)
+            .unavailable => .unavailable(message, details)
+            .data_loss => .data_loss(message, details)
+            .unauthenticated => .unauthenticated(message, details)
+            default => .unknown(message, details)
+        }
+    }
+
+    /// Returns the gRPC `StatusCode` represented by this error.
+    + get code: StatusCode {
+        return match this : StatusCode {
+            .cancelled(_, _) => .cancelled
+            .unknown(_, _) => .unknown
+            .invalid_argument(_, _) => .invalid_argument
+            .deadline_exceeded(_, _) => .deadline_exceeded
+            .not_found(_, _) => .not_found
+            .already_exists(_, _) => .already_exists
+            .permission_denied(_, _) => .permission_denied
+            .resource_exhausted(_, _) => .resource_exhausted
+            .failed_precondition(_, _) => .failed_precondition
+            .aborted(_, _) => .aborted
+            .out_of_range(_, _) => .out_of_range
+            .unimplemented(_, _) => .unimplemented
+            .internal(_, _) => .internal
+            .unavailable(_, _) => .unavailable
+            .data_loss(_, _) => .data_loss
+            .unauthenticated(_, _) => .unauthenticated
+        }
+    }
+
+    /// Returns the human-readable error message.
+    + get message: String {
+        return match this : String {
+            .cancelled(msg, _) => msg
+            .unknown(msg, _) => msg
+            .invalid_argument(msg, _) => msg
+            .deadline_exceeded(msg, _) => msg
+            .not_found(msg, _) => msg
+            .already_exists(msg, _) => msg
+            .permission_denied(msg, _) => msg
+            .resource_exhausted(msg, _) => msg
+            .failed_precondition(msg, _) => msg
+            .aborted(msg, _) => msg
+            .out_of_range(msg, _) => msg
+            .unimplemented(msg, _) => msg
+            .internal(msg, _) => msg
+            .unavailable(msg, _) => msg
+            .data_loss(msg, _) => msg
+            .unauthenticated(msg, _) => msg
+        }
+    }
+
+    /// Returns optional raw binary error details (`grpc-status-details-bin`), or `""`.
+    + get details: String {
+        return match this : String {
+            .cancelled(_, det) => det
+            .unknown(_, det) => det
+            .invalid_argument(_, det) => det
+            .deadline_exceeded(_, det) => det
+            .not_found(_, det) => det
+            .already_exists(_, det) => det
+            .permission_denied(_, det) => det
+            .resource_exhausted(_, det) => det
+            .failed_precondition(_, det) => det
+            .aborted(_, det) => det
+            .out_of_range(_, det) => det
+            .unimplemented(_, det) => det
+            .internal(_, det) => det
+            .unavailable(_, det) => det
+            .data_loss(_, det) => det
+            .unauthenticated(_, det) => det
+        }
+    }
+
+    + fn to_string() String $auto {
+        let msg = this.message
+        if msg.bytes == 0 : return this.code.status_name()
+        return "%{this.code.status_name()}: %{msg}"
+    }
+}
+
+/// Shorthand constructor for a `GrpcError` from a `StatusCode` and optional message/details.
++ fn err(code: StatusCode, message: String (""), details: String ("")) GrpcError {
+    return GrpcError.from_status(code, message, details)
+}

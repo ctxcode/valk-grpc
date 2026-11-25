@@ -1,0 +1,108 @@
+use valk.time
+
+/// Per-RPC client call configuration.
++ class CallOptions {
+    /// Custom request metadata sent as HTTP/2 headers.
+    + metadata: ?Metadata (null)
+    /// Per-call deadline in milliseconds (0 uses client default or no deadline).
+    + timeout_ms: uint (0)
+    /// Request message compression algorithm (`identity` or `gzip`).
+    + compression: Compression (.identity)
+    /// Overrides the client's maximum incoming message size (0 uses client default).
+    + max_recv_size: uint (0)
+    /// Overrides the client's maximum outgoing message size (0 uses client default).
+    + max_send_size: uint (0)
+
+    /// Returns `metadata`, allocating an empty `Metadata` if unset.
+    + fn get_metadata() Metadata {
+        let md = this.metadata
+        if isset(md) : return md
+        let created = Metadata.new()
+        this.metadata = created
+        return created
+    }
+
+    /// Sets a metadata header entry on this call.
+    + fn set_header(key: String, value: String) {
+        this.get_metadata().set(key, value)
+    }
+
+    /// Sets a binary (`-bin`) metadata header entry on this call.
+    + fn set_bin_header(key: String, data: local &[u8]) {
+        this.get_metadata().set_bin(key, data)
+    }
+}
+
+/// Raw result of a unary gRPC client call, including response headers and trailers.
++ class UnaryResponse {
+    /// Raw decoded response message bytes (e.g. protobuf wire bytes).
+    + body: String ("")
+    /// Initial response metadata received from the server.
+    + headers: Metadata (.{})
+    /// Trailing response metadata received from the server.
+    + trailers: Metadata (.{})
+}
+
+/// Server-side context for an active gRPC call.
++ class CallContext {
+    /// Full gRPC method path (e.g. `"/helloworld.Greeter/SayHello"`).
+    + method: String ("")
+    /// Request `:authority` header value.
+    + authority: String ("")
+    /// Incoming request metadata (headers).
+    + metadata: Metadata (.{})
+    /// Initial response metadata sent before the first response message.
+    + response_headers: Metadata (.{})
+    /// Trailing response metadata sent after the response body alongside `grpc-status`.
+    + response_trailers: Metadata (.{})
+    /// Monotonic deadline timestamp in milliseconds (0 means no deadline).
+    + deadline_ms: uint (0)
+    /// Remote peer address string.
+    + peer_address: String ("")
+    /// Compression used for outgoing response messages (falls back to `identity` if client does not accept gzip).
+    + compression: Compression (.identity)
+    /// Whether the client advertised `gzip` in `grpc-accept-encoding`.
+    + client_accepts_gzip: bool (false)
+
+    /// Returns true if this call has a deadline that has already passed.
+    + fn is_expired() bool {
+        if this.deadline_ms == 0 : return false
+        return time.mono_ms() >= this.deadline_ms
+    }
+
+    /// Returns milliseconds remaining until the deadline, or `0` if none or already expired.
+    + fn remaining_ms() uint {
+        if this.deadline_ms == 0 : return 0
+        let now = time.mono_ms()
+        if now >= this.deadline_ms : return 0
+        return this.deadline_ms - now
+    }
+
+    /// Sets an outgoing initial response header.
+    + fn set_header(key: String, value: String) {
+        this.response_headers.set(key, value)
+    }
+
+    /// Sets an outgoing response trailer.
+    + fn set_trailer(key: String, value: String) {
+        this.response_trailers.set(key, value)
+    }
+}
+
+/// Handler for a unary RPC (`/pkg.Service/Method`): one request message, one response message.
++ type UnaryHandler (fn(CallContext, String)(String !GrpcError))
+
+/// Handler for a server-streaming RPC: one request message, zero or more streamed responses.
++ type ServerStreamHandler (fn(CallContext, String, ServerStream)(void !GrpcError))
+
+/// Handler for a client-streaming RPC: zero or more streamed requests, one response message.
++ type ClientStreamHandler (fn(ServerStream)(String !GrpcError))
+
+/// Handler for a bidirectional streaming RPC.
++ type BidiStreamHandler (fn(ServerStream)(void !GrpcError))
+
+/// Server middleware wrapping unary RPC execution.
++ type UnaryInterceptor (fn(CallContext, String, UnaryHandler)(String !GrpcError))
+
+/// Server middleware wrapping streaming RPC execution.
++ type StreamInterceptor (fn(ServerStream, BidiStreamHandler)(void !GrpcError))

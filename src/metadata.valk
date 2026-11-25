@@ -1,0 +1,247 @@
+use valk.crypto
+
+/// Ordered gRPC metadata (headers or trailers) with lowercase ASCII keys.
+///
+/// Keys ending in `-bin` carry raw binary values encoded as base64 on the wire; use
+/// `set_bin`, `append_bin`, `get_bin`, and `get_all_bin` for those entries.
++ class Metadata {
+    - keys: Array[String] (.{})
+    - values: Array[String] (.{})
+
+    /// Creates an empty `Metadata` collection.
+    + static fn new() SELF $default {
+        return SELF {}
+    }
+
+    /// Total number of key/value entries (including repeated keys).
+    + get length: uint {
+        return this.keys.length
+    }
+
+    /// Appends a key/value entry without removing existing entries for `key`.
+    + fn append(key: String, value: String) {
+        this.keys.append(key.lower())
+        this.values.append(value)
+    }
+
+    /// Replaces all entries for `key` with a single `value`.
+    + fn set(key: String, value: String) $offset_assign $set_key {
+        let lower = key.lower()
+        this.remove(lower)
+        this.keys.append(lower)
+        this.values.append(value)
+    }
+
+    /// Returns the first value for `key`, or `null` when absent.
+    + fn get(key: String) ?String {
+        let lower = key.lower()
+        each this.keys as k, i {
+            if k == lower : return this.values.get(i) !? null
+        }
+        return null
+    }
+
+    /// Returns all values associated with `key` in insertion order.
+    + fn get_all(key: String) Array[String] {
+        let lower = key.lower()
+        let out = Array[String].new()
+        each this.keys as k, i {
+            if k == lower {
+                let v = this.values.get(i) ! continue
+                out.append(v)
+            }
+        }
+        return out
+    }
+
+    /// Returns true if at least one entry exists for `key`.
+    + fn has(key: String) bool {
+        return isset(this.get(key))
+    }
+
+    /// Removes all entries matching `key`.
+    + fn remove(key: String) {
+        let lower = key.lower()
+        let i = this.keys.length
+        while i > 0 {
+            i--
+            let k = this.keys.get(i) ! continue
+            if k == lower {
+                this.keys.remove(i)
+                this.values.remove(i)
+            }
+        }
+    }
+
+    /// Removes all entries.
+    + fn clear() {
+        this.keys.clear()
+        this.values.clear()
+    }
+
+    /// Returns an independent copy of this metadata.
+    + fn copy() SELF {
+        return SELF {
+            keys: this.keys.copy()
+            values: this.values.copy()
+        }
+    }
+
+    /// Sets a binary (`-bin`) metadata entry, base64-encoding `data` for wire transport.
+    /// Automatically appends `-bin` to `key` if not already present.
+    + fn set_bin(key: String, data: local &[u8]) {
+        let k = normalize_bin_key(key)
+        this.set(k, crypto.base64_encode(data))
+    }
+
+    /// Appends a binary (`-bin`) metadata entry, base64-encoding `data`.
+    + fn append_bin(key: String, data: local &[u8]) {
+        let k = normalize_bin_key(key)
+        this.append(k, crypto.base64_encode(data))
+    }
+
+    /// Returns the decoded binary value for a `-bin` key, or `null` when absent.
+    + fn get_bin(key: String) ?String !GrpcError {
+        let k = normalize_bin_key(key)
+        let raw = this.get(k) ?! return null
+        return decode_bin_header(raw) !>
+    }
+
+    /// Returns all decoded binary values for a `-bin` key.
+    + fn get_all_bin(key: String) Array[String] !GrpcError {
+        let k = normalize_bin_key(key)
+        let encoded = this.get_all(k)
+        let out = Array[String].new()
+        each encoded as raw {
+            // Multiple binary values may be comma-joined in HTTP/2 headers
+            let parts = raw.split(",")
+            each parts as part {
+                let trimmed = part.trim()
+                if trimmed.bytes == 0 : continue
+                out.append(decode_bin_header(trimmed) !>)
+            }
+        }
+        return out
+    }
+
+    fn _next(index: uint) (String, String) !IterError {
+        let k = this.keys.get(index) ! throw .end
+        let v = this.values.get(index) ! throw .end
+        return (v, k)
+    }
+}
+
+fn normalize_bin_key(key: String) String {
+    let lower = key.lower()
+    if lower.ends_with("-bin") : return lower
+    return lower + "-bin"
+}
+
+fn decode_bin_header(raw: String) String !GrpcError {
+    return crypto.base64_decode(raw) ! throw err(.internal, "Invalid base64 in binary metadata")
+}
+
+/// Returns true if `key` is a valid lowercase gRPC metadata header name.
++ fn is_valid_metadata_key(key: String) bool {
+    if key.bytes == 0 || key.starts_with(":") : return false
+    let i: uint = 0
+    while i < key.bytes {
+        let c = key[i]
+        let ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'
+        if !ok : return false
+        i++
+    }
+    return true
+}
+
+/// Returns true if `key` is a gRPC/HTTP2 transport-reserved header not exposed as user metadata.
+fn is_reserved_transport_header(key: String) bool {
+    return key.starts_with(":") || key == "content-type" || key == "te"
+        || key == "grpc-encoding" || key == "grpc-accept-encoding"
+        || key == "grpc-timeout" || key == "grpc-status"
+        || key == "grpc-message" || key == "grpc-status-details-bin"
+        || key == "content-length" || key == "user-agent"
+}
+
+/// Percent-encodes a `grpc-message` header value per the gRPC HTTP/2 specification.
+/// Characters outside printable ASCII (0x20..=0x7E) and `%` are encoded as `%XX`.
++ fn percent_encode(msg: String) String {
+    let out = ByteBuffer.new(msg.bytes)
+    let hex = "0123456789ABCDEF"
+    let i: uint = 0
+    while i < msg.bytes {
+        let b = msg[i]
+        if b < 0x20 || b > 0x7E || b == '%' {
+            out.write_byte('%')
+            out.write_byte(hex[(b >> 4).to(uint)])
+            out.write_byte(hex[(b & 0x0F).to(uint)])
+        } else {
+            out.write_byte(b)
+        }
+        i++
+    }
+    return out.into_string()
+}
+
+/// Percent-decodes a `grpc-message` header value per the gRPC HTTP/2 specification.
++ fn percent_decode(encoded: String) String {
+    if !encoded.contains("%") : return encoded
+    let out = ByteBuffer.new(encoded.bytes)
+    let i: uint = 0
+    while i < encoded.bytes {
+        let b = encoded[i]
+        if b == '%' && i + 2 < encoded.bytes && encoded[i + 1].is_hex() && encoded[i + 2].is_hex() {
+            let hi = encoded[i + 1].hex_byte_to_hex_value()
+            let lo = encoded[i + 2].hex_byte_to_hex_value()
+            out.write_byte(((hi << 4) | lo).to(u8))
+            i += 3
+        } else {
+            out.write_byte(b)
+            i++
+        }
+    }
+    return out.into_string()
+}
+
+/// Formats a timeout in milliseconds as a gRPC `grpc-timeout` header value (e.g. `"500m"`, `"30S"`).
++ fn format_timeout_ms(timeout_ms: uint) String {
+    if timeout_ms == 0 : return "1n"
+    if timeout_ms <= 99_999_999 : return "%{timeout_ms}m"
+    let secs = (timeout_ms + 999) / 1000
+    if secs <= 99_999_999 : return "%{secs}S"
+    let mins = (secs + 59) / 60
+    if mins <= 99_999_999 : return "%{mins}M"
+    let hours = (mins + 59) / 60
+    if hours > 99_999_999 : hours = 99_999_999
+    return "%{hours}H"
+}
+
+/// Parses a gRPC `grpc-timeout` header value into milliseconds.
+/// Supports units `H` (hours), `M` (minutes), `S` (seconds), `m` (milliseconds),
+/// `u` (microseconds), and `n` (nanoseconds).
++ fn parse_timeout_ms(value: String) uint !GrpcError {
+    let s = value.trim()
+    if s.bytes < 2 || s.bytes > 9 {
+        throw err(.invalid_argument, "Invalid grpc-timeout value: %{value}")
+    }
+    let unit = s[s.bytes - 1]
+    let num_str = s.range(0, s.bytes - 1)
+    let i: uint = 0
+    while i < num_str.bytes {
+        let c = num_str[i]
+        if c < '0' || c > '9' {
+            throw err(.invalid_argument, "Invalid grpc-timeout digits: %{value}")
+        }
+        i++
+    }
+    let amount = num_str.to_uint() ! throw err(.invalid_argument, "Invalid grpc-timeout number: %{value}")
+    return match unit : uint {
+        'H' => amount * 3_600_000
+        'M' => amount * 60_000
+        'S' => amount * 1_000
+        'm' => amount
+        'u' => amount == 0 ? 0 : (amount + 999) / 1_000
+        'n' => amount == 0 ? 0 : (amount + 999_999) / 1_000_000
+        default => throw err(.invalid_argument, "Invalid grpc-timeout unit in: %{value}")
+    }
+}

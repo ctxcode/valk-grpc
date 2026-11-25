@@ -1,0 +1,11 @@
+{
+    "src": ".",
+    "dependencies": {
+        "grpc": {
+            "src": "../"
+        },
+        "protobuf": {
+            "src": "../../valk-protobuf"
+        }
+    }
+}

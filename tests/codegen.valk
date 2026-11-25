@@ -1,0 +1,141 @@
+use valk.core
+use valk.fs
+use protobuf
+
+test "End-to-end valk-protoc --grpc generated stubs compile with --deny-warnings and run all 4 RPC modes" {
+    let schema = "
+syntax = \"proto3\";
+package greeter.v1;
+
+message HelloRequest {
+    string name = 1;
+}
+
+message HelloReply {
+    string message = 1;
+    int32 count = 2;
+}
+
+service Greeter {
+    rpc SayHello(HelloRequest) returns (HelloReply);
+    rpc StreamGreetings(HelloRequest) returns (stream HelloReply);
+    rpc CollectNames(stream HelloRequest) returns (HelloReply);
+    rpc Chat(stream HelloRequest) returns (stream HelloReply);
+}
+"
+    let file = protobuf.parse_proto(schema) ! { assert(false) return }
+    let generated = protobuf.generate_valk(file, protobuf.CodegenOptions { emit_grpc: true })
+
+    let tmp_dir = "tests/tmp/e2e_grpc"
+    fs.create_dir_all(tmp_dir) ! { assert(false) return }
+    defer fs.delete_all(tmp_dir) _
+
+    let valk_json = "{\n    \"src\": \".\",\n    \"dependencies\": {\n        \"grpc\": {\n            \"src\": \"../../..\"\n        },\n        \"protobuf\": {\n            \"src\": \"../../../../valk-protobuf\"\n        }\n    }\n}\n"
+    fs.write("%{tmp_dir}/valk.json", valk_json) ! { assert(false) return }
+    fs.write("%{tmp_dir}/greeter.valk", generated) ! { assert(false) return }
+
+    let driver = "use grpc
+
+class MyGreeter is GreeterService {
+    + fn say_hello(ctx: grpc.CallContext, req: HelloRequest) HelloReply !grpc.GrpcError {
+        let _ = ctx
+        if req.name == \"forbidden\" : throw grpc.err(.permission_denied, \"nope\")
+        return HelloReply { message: \"Hello, \" + req.name + \"!\", count: 1 }
+    }
+
+    + fn stream_greetings(ctx: grpc.CallContext, req: HelloRequest, stream: grpc.TypedServerStream[HelloRequest, HelloReply]) void !grpc.GrpcError {
+        let _ = ctx
+        let i: i32 = 1
+        while i <= 3 {
+            stream.send(HelloReply { message: \"Hi \" + req.name + \" #\" + i.to_string(), count: i }) !>
+            i++
+        }
+    }
+
+    + fn collect_names(stream: grpc.TypedServerStream[HelloRequest, HelloReply]) HelloReply !grpc.GrpcError {
+        let names = Array[String]{}
+        while true {
+            let req = (stream.recv() !>) ?! break
+            names.append(req.name)
+        }
+        return HelloReply { message: names.join(\", \"), count: names.length.to(i32) }
+    }
+
+    + fn chat(stream: grpc.TypedServerStream[HelloRequest, HelloReply]) void !grpc.GrpcError {
+        let n: i32 = 0
+        while true {
+            let req = (stream.recv() !>) ?! break
+            n++
+            stream.send(HelloReply { message: \"echo:\" + req.name, count: n }) !>
+        }
+    }
+}
+
+fn main() {
+    let srv = grpc.GrpcServer.new(\"127.0.0.1\", 0)
+    register_Greeter_service(srv, MyGreeter {})
+    let port = srv.bind() ! panic(E.to_string())
+    co srv.start()
+    defer srv.shutdown(1000)
+
+    let raw_client = grpc.GrpcClient.connect(\"127.0.0.1:\" + port.to_string()) ! panic(E.to_string())
+    defer raw_client.close()
+    let stub = GreeterClient.new(raw_client)
+
+    // 1. Unary
+    let r1 = stub.say_hello(HelloRequest { name: \"Valk\" }) ! panic(E.to_string())
+    assert(r1.message == \"Hello, Valk!\" && r1.count == 1)
+
+    // 1b. Unary error
+    let denied = false
+    stub.say_hello(HelloRequest { name: \"forbidden\" }) ! {
+        denied = E.code == grpc.StatusCode.permission_denied && E.message == \"nope\"
+    }
+    assert(denied)
+
+    // 2. Server streaming
+    let ss = stub.stream_greetings(HelloRequest { name: \"World\" }) ! panic(E.to_string())
+    let scount: i32 = 0
+    while true {
+        let item = (ss.recv() ! panic(E.to_string())) ?! break
+        scount++
+        assert(item.count == scount && item.message == \"Hi World #\" + scount.to_string())
+    }
+    assert(scount == 3)
+
+    // 3. Client streaming
+    let cs = stub.collect_names() ! panic(E.to_string())
+    cs.send(HelloRequest { name: \"Alice\" }) ! panic(E.to_string())
+    cs.send(HelloRequest { name: \"Bob\" }) ! panic(E.to_string())
+    let cres = cs.finish() ! panic(E.to_string())
+    assert(cres.message == \"Alice, Bob\" && cres.count == 2)
+
+    // 4. Bidi streaming
+    let bs = stub.chat() ! panic(E.to_string())
+    bs.send(HelloRequest { name: \"one\" }) ! panic(E.to_string())
+    let b1 = (bs.recv() ! panic(E.to_string())) ?! panic(\"expected b1\")
+    assert(b1.message == \"echo:one\" && b1.count == 1)
+    bs.send(HelloRequest { name: \"two\" }) ! panic(E.to_string())
+    let b2 = (bs.recv() ! panic(E.to_string())) ?! panic(\"expected b2\")
+    assert(b2.message == \"echo:two\" && b2.count == 2)
+    bs.close_send() ! panic(E.to_string())
+    let bend = bs.recv() ! panic(E.to_string())
+    assert(!isset(bend))
+}
+"
+    fs.write("%{tmp_dir}/main.valk", driver) ! { assert(false) return }
+
+    let lint_rc, lint_out = core.exec("valk build %{tmp_dir} --lint --deny-warnings")
+    if lint_rc != 0 {
+        println("Generated gRPC code failed lint:\n%{lint_out}")
+        assert(false)
+        return
+    }
+
+    let run_rc, run_out = core.exec("valk build %{tmp_dir} --run")
+    if run_rc != 0 {
+        println("Generated gRPC code failed run:\n%{run_out}")
+        assert(false)
+        return
+    }
+}

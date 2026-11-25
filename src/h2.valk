@@ -1,0 +1,266 @@
+use valk.net
+
+// RFC 9113 HTTP/2 framing primitives and ALPN setup for gRPC.
+
+value H2_PREFACE ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+value H2_DEFAULT_MAX_FRAME_SIZE (16_384)
+value H2_DEFAULT_WINDOW (65_535)
+value H2_TARGET_WINDOW (262_144)
+
+value H2_DATA (0)
+value H2_HEADERS (1)
+value H2_PRIORITY (2)
+value H2_RST_STREAM (3)
+value H2_SETTINGS (4)
+value H2_PUSH_PROMISE (5)
+value H2_PING (6)
+value H2_GOAWAY (7)
+value H2_WINDOW_UPDATE (8)
+value H2_CONTINUATION (9)
+
+value H2_FLAG_END_STREAM (0x01)
+value H2_FLAG_ACK (0x01)
+value H2_FLAG_END_HEADERS (0x04)
+value H2_FLAG_PADDED (0x08)
+value H2_FLAG_PRIORITY (0x20)
+
+value H2_ERR_NO_ERROR (0)
+value H2_ERR_PROTOCOL (1)
+value H2_ERR_INTERNAL (2)
+value H2_ERR_FLOW_CONTROL (3)
+value H2_ERR_FRAME_SIZE (6)
+value H2_ERR_REFUSED_STREAM (7)
+value H2_ERR_CANCEL (8)
+value H2_ERR_COMPRESSION (9)
+
+extern fn SSL_CTX_set_alpn_select_cb(ctx: ptr, callback: fnptr(ptr, *ptr, *u8, ptr, u32, ?ptr)(i32), arg: ?ptr) void;
+
+fn grpc_h2_alpn_select(ssl: ptr, out: *ptr, length: *u8, input: ptr, size: u32, arg: ?ptr) i32 $entrance {
+    let _ = ssl
+    let _ = arg
+    let offset: uint = 0
+    while offset < size {
+        let count = @ptrv(input, u8, offset).to(uint)
+        offset++
+        if count == 0 || count > size - offset : return 2
+        if count == 2 && @ptrv(input, u8, offset) == 'h' && @ptrv(input, u8, offset + 1) == '2' {
+            @ptrv(out, ptr, 0) = input.@offset(offset)
+            @ptrv(length, u8, 0) = 2
+            return 0
+        }
+        offset += count
+    }
+    return 2
+}
+
+fn enable_h2_server_alpn(ctx: atomic net.SslServerContext) {
+    @unsafe
+    SSL_CTX_set_alpn_select_cb(ctx.ctx.@cast(ptr), grpc_h2_alpn_select, null)
+}
+
+class H2Frame {
+    kind: u8
+    flags: u8 (0)
+    stream: u32 (0)
+    payload: String ("")
+
+    fn fragment() String !GrpcError {
+        let start: uint = 0
+        let end = this.payload.bytes
+        if this.kind != H2_DATA && this.kind != H2_HEADERS && this.kind != H2_PUSH_PROMISE {
+            return this.payload
+        }
+        if (this.flags & H2_FLAG_PADDED) != 0 {
+            if end == 0 : throw err(.internal, "Invalid padded HTTP/2 frame")
+            let pad = this.payload[0].to(uint)
+            if pad >= end : throw err(.internal, "HTTP/2 padding exceeds payload")
+            start = 1
+            end -= pad
+        }
+        let prefix: uint = 0
+        if this.kind == H2_HEADERS && (this.flags & H2_FLAG_PRIORITY) != 0 : prefix = 5
+        if this.kind == H2_PUSH_PROMISE : prefix = 4
+        if prefix > end - start : throw err(.internal, "HTTP/2 frame header truncated")
+        return this.payload.range(start + prefix, end - start - prefix)
+    }
+}
+
+class H2Settings {
+    header_table_size: u32 (4096)
+    enable_push: bool (true)
+    max_concurrent_streams: u32 (0xffffffff)
+    initial_window_size: u32 (65_535)
+    max_frame_size: u32 (16_384)
+    max_header_list_size: u32 (0xffffffff)
+
+    fn apply(payload: local &[u8]) !GrpcError {
+        if payload.length % 6 != 0 : throw err(.internal, "Invalid HTTP/2 SETTINGS length")
+        let pos: uint = 0
+        while pos < payload.length {
+            let id: u32 = (payload[pos].to(u32) << 8) | payload[pos + 1].to(u32)
+            let val: u32 = (payload[pos + 2].to(u32) << 24)
+                | (payload[pos + 3].to(u32) << 16)
+                | (payload[pos + 4].to(u32) << 8)
+                | payload[pos + 5].to(u32)
+            if id == 1 : this.header_table_size = val
+            else if id == 2 : this.enable_push = val != 0
+            else if id == 3 : this.max_concurrent_streams = val
+            else if id == 4 {
+                if val > 0x7fffffff : throw err(.internal, "HTTP/2 INITIAL_WINDOW_SIZE overflow")
+                this.initial_window_size = val
+            } else if id == 5 {
+                if val < 16_384 || val > 0xffffff : throw err(.internal, "Invalid HTTP/2 MAX_FRAME_SIZE")
+                this.max_frame_size = val
+            } else if id == 6 : this.max_header_list_size = val
+            pos += 6
+        }
+    }
+}
+
+class H2HeaderAssembler {
+    stream: u32 (0)
+    end_stream: bool (false)
+    buf: ByteBuffer (.new(0))
+    max_size: uint (65_536)
+
+    fn accept(frame: H2Frame) ?String !GrpcError {
+        if this.stream != 0 {
+            if frame.kind != H2_CONTINUATION || frame.stream != this.stream {
+                throw err(.internal, "Expected HTTP/2 CONTINUATION frame")
+            }
+        } else {
+            if frame.kind == H2_CONTINUATION : throw err(.internal, "Unexpected HTTP/2 CONTINUATION frame")
+            if frame.kind != H2_HEADERS : return null
+            if frame.stream == 0 : throw err(.internal, "HTTP/2 HEADERS on stream 0")
+            this.end_stream = (frame.flags & H2_FLAG_END_STREAM) != 0
+            if (frame.flags & H2_FLAG_END_HEADERS) != 0 {
+                let frag = frame.fragment() !>
+                if frag.bytes > this.max_size : throw err(.resource_exhausted, "HTTP/2 header block too large")
+                return frag
+            }
+            this.stream = frame.stream
+            this.buf.clear()
+        }
+        let frag = frame.fragment() !>
+        if this.buf.length > this.max_size || frag.bytes > this.max_size - this.buf.length {
+            throw err(.resource_exhausted, "HTTP/2 header block too large")
+        }
+        this.buf.write(frag)
+        if (frame.flags & H2_FLAG_END_HEADERS) == 0 : return null
+        let block = this.buf.into_string()
+        this.buf = ByteBuffer.new(0)
+        this.stream = 0
+        return block
+    }
+}
+
+fn h2_write_frame_header(out: ByteBuffer, len: uint, kind: u8, flags: u8, stream: u32) {
+    out.write_byte((len >> 16).to(u8))
+    out.write_byte((len >> 8).to(u8))
+    out.write_byte(len.to(u8))
+    out.write_byte(kind)
+    out.write_byte(flags)
+    out.write_u32_be(stream & 0x7fffffff)
+}
+
+fn h2_encode_frame(out: ByteBuffer, kind: u8, flags: u8, stream: u32, payload: local &[u8]) {
+    h2_write_frame_header(out, payload.length, kind, flags, stream)
+    if payload.length > 0 : out.write(payload)
+}
+
+fn h2_encode_headers(out: ByteBuffer, stream: u32, block: local &[u8], end_stream: bool, max_frame: uint) {
+    let limit = max_frame < H2_DEFAULT_MAX_FRAME_SIZE ? H2_DEFAULT_MAX_FRAME_SIZE : max_frame
+    let total = block.length
+    let first_len = total < limit ? total : limit
+    let flags: u8 = end_stream ? H2_FLAG_END_STREAM : 0
+    if first_len == total : flags |= H2_FLAG_END_HEADERS
+    h2_encode_frame(out, H2_HEADERS, flags, stream, block.view(0, first_len))
+    let pos = first_len
+    while pos < total {
+        let next = pos + limit
+        if next > total : next = total
+        let cflags: u8 = next == total ? H2_FLAG_END_HEADERS : 0
+        h2_encode_frame(out, H2_CONTINUATION, cflags, stream, block.view(pos, next - pos))
+        pos = next
+    }
+}
+
+fn h2_encode_window_update(out: ByteBuffer, stream: u32, inc: u32) {
+    h2_write_frame_header(out, 4, H2_WINDOW_UPDATE, 0, stream)
+    out.write_u32_be(inc & 0x7fffffff)
+}
+
+fn h2_encode_rst_stream(out: ByteBuffer, stream: u32, code: u32) {
+    h2_write_frame_header(out, 4, H2_RST_STREAM, 0, stream)
+    out.write_u32_be(code)
+}
+
+fn h2_encode_goaway(out: ByteBuffer, last_stream: u32, code: u32) {
+    h2_write_frame_header(out, 8, H2_GOAWAY, 0, 0)
+    out.write_u32_be(last_stream & 0x7fffffff)
+    out.write_u32_be(code)
+}
+
+fn h2_encode_ping(out: ByteBuffer, payload: local &[u8], ack: bool) {
+    h2_write_frame_header(out, 8, H2_PING, ack ? H2_FLAG_ACK : 0, 0)
+    out.write(payload.view(0, 8))
+}
+
+fn h2_encode_settings_ack(out: ByteBuffer) {
+    h2_write_frame_header(out, 0, H2_SETTINGS, H2_FLAG_ACK, 0)
+}
+
+fn h2_encode_initial_settings(out: ByteBuffer, max_streams: u32, window_size: u32, max_frame_size: u32, is_client: bool) {
+    let count: uint = is_client ? 3 : 3
+    h2_write_frame_header(out, count * 6, H2_SETTINGS, 0, 0)
+    if is_client {
+        // ENABLE_PUSH = 0
+        out.write_u16_be(2)
+        out.write_u32_be(0)
+    } else {
+        // MAX_CONCURRENT_STREAMS
+        out.write_u16_be(3)
+        out.write_u32_be(max_streams)
+    }
+    // INITIAL_WINDOW_SIZE
+    out.write_u16_be(4)
+    out.write_u32_be(window_size)
+    // MAX_FRAME_SIZE
+    out.write_u16_be(5)
+    out.write_u32_be(max_frame_size)
+
+    if window_size > H2_DEFAULT_WINDOW {
+        h2_encode_window_update(out, 0, window_size - H2_DEFAULT_WINDOW)
+    }
+}
+
+fn h2_try_read_frame(buf: ByteBuffer, max_frame_size: uint) ?H2Frame !GrpcError {
+    if buf.length < 9 : return null
+    let view = buf.view()
+    let len: uint = (view[0].to(uint) << 16)
+        | (view[1].to(uint) << 8)
+        | view[2].to(uint)
+    if len > max_frame_size : throw err(.internal, "HTTP/2 frame exceeds max size")
+    if buf.length - 9 < len : return null
+    let kind = view[3]
+    let flags = view[4]
+    let stream: u32 = ((view[5].to(u32) << 24)
+        | (view[6].to(u32) << 16)
+        | (view[7].to(u32) << 8)
+        | view[8].to(u32)) & 0x7fffffff
+    let payload = len > 0 ? view.view(9, len).to_string() : ""
+    buf.clear_until(9 + len)
+    return H2Frame {
+        kind: kind
+        flags: flags
+        stream: stream
+        payload: payload
+    }
+}
+
+fn h2_read_u32_be(data: local &[u8], offset: uint) u32 {
+    return (data[offset].to(u32) << 24)
+        | (data[offset + 1].to(u32) << 16)
+        | (data[offset + 2].to(u32) << 8)
+        | data[offset + 3].to(u32)
+}

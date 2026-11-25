@@ -1,0 +1,996 @@
+use valk.net
+use valk.sync
+use valk.time
+use valk.crypto
+
+enum MethodKind: u8 {
+    unary (0)
+    server_stream (1)
+    client_stream (2)
+    bidi_stream (3)
+}
+
+class RegisteredMethod {
+    kind: MethodKind
+    unary_handler: ?UnaryHandler (null)
+    server_stream_handler: ?ServerStreamHandler (null)
+    client_stream_handler: ?ClientStreamHandler (null)
+    bidi_stream_handler: ?BidiStreamHandler (null)
+}
+
+/// Server-side stream handle for reading request messages and sending response messages.
++ class ServerStream {
+    /// Metadata, deadline, and response header/trailer state for this RPC.
+    ~ ctx: CallContext
+    - conn: ServerH2Conn
+    - stream_id: u32
+    - waker: sync.Waker
+    - decoder: FrameDecoder
+    - send_window: int (H2_DEFAULT_WINDOW)
+    - recv_window: int (H2_TARGET_WINDOW)
+    - unacked_recv: uint (0)
+    - remote_eof: bool (false)
+    - cancelled: bool (false)
+    - headers_sent: bool (false)
+    - finished: bool (false)
+    - max_send_size: uint (DEFAULT_MAX_MESSAGE_SIZE)
+    - send_window_waiters: Array[sync.Waker] (.{})
+
+    /// Receives the next length-prefixed request message, or `null` when the client closes its send side.
+    + fn recv() ?String !GrpcError {
+        while true {
+            let msg = this.decoder.next() !>
+            if isset(msg) : return msg
+
+            if this.cancelled {
+                throw err(.cancelled, "Client cancelled stream")
+            }
+            if this.ctx.is_expired() {
+                throw err(.deadline_exceeded, "RPC deadline exceeded")
+            }
+            if this.remote_eof {
+                if this.decoder.has_partial() {
+                    throw err(.internal, "Truncated gRPC request message")
+                }
+                return null
+            }
+            if this.conn.closed {
+                throw err(.cancelled, "Connection closed")
+            }
+
+            let wait_ms: uint = 50
+            if this.ctx.deadline_ms > 0 {
+                let rem = this.ctx.remaining_ms()
+                if rem == 0 : throw err(.deadline_exceeded, "RPC deadline exceeded")
+                if rem < wait_ms : wait_ms = rem
+            }
+            this.waker.wait(wait_ms)
+        }
+    }
+
+    /// Sends initial response headers explicitly before sending any response message.
+    + fn send_header(headers: ?Metadata (null)) !GrpcError {
+        if this.headers_sent : return
+        if isset(headers) {
+            each headers as val, key {
+                this.ctx.response_headers.append(key, val)
+            }
+        }
+        this.conn.send_response_headers(this, false) !>
+    }
+
+    /// Sends one length-prefixed response message to the client.
+    + fn send(payload: local &[u8]) !GrpcError {
+        if this.cancelled : throw err(.cancelled, "Stream cancelled")
+        if this.ctx.is_expired() : throw err(.deadline_exceeded, "RPC deadline exceeded")
+        if !this.headers_sent {
+            this.conn.send_response_headers(this, false) !>
+        }
+        let comp = this.effective_compression()
+        let frame = encode_frame(payload, comp, this.max_send_size) !>
+        this.conn.send_stream_data(this, frame) !>
+    }
+
+    /// Sets a trailing metadata header sent when the RPC completes.
+    + fn set_trailer(key: String, value: String) {
+        this.ctx.response_trailers.set(key, value)
+    }
+
+    /// Returns the outgoing response trailers collection.
+    + fn trailers() Metadata {
+        return this.ctx.response_trailers
+    }
+
+    /// Returns true if the client cancelled the stream or the connection closed.
+    + fn is_cancelled() bool {
+        return this.cancelled || this.conn.closed
+    }
+
+    fn effective_compression() Compression {
+        if this.ctx.compression == .gzip && this.ctx.client_accepts_gzip : return .gzip
+        return .identity
+    }
+
+    fn wake_window_waiters() {
+        while this.send_window_waiters.length > 0 {
+            let w = this.send_window_waiters.pop_first() ! break
+            w.wake()
+        }
+    }
+}
+
+/// Pure-Valk gRPC server over HTTP/2 (`h2c` cleartext prior knowledge or TLS ALPN `h2`).
++ class GrpcServer {
+    /// Listen host/address.
+    + host: String ("127.0.0.1")
+    /// Configured port (`0` selects an ephemeral OS port).
+    + port: u16 (50051)
+    /// Actual bound port once `bind()` or `start()` has been called.
+    ~ bound_port: u16 (0)
+    /// Maximum incoming message size in bytes.
+    + max_recv_message_size: uint (DEFAULT_MAX_MESSAGE_SIZE)
+    /// Maximum outgoing message size in bytes.
+    + max_send_message_size: uint (DEFAULT_MAX_MESSAGE_SIZE)
+    /// Maximum concurrent HTTP/2 streams advertised per connection.
+    + max_concurrent_streams: u32 (256)
+    /// Maximum HPACK header list size in bytes.
+    + max_header_list_size: uint (64 * 1024)
+    /// Idle connection timeout in milliseconds (0 disables idle timeout).
+    + idle_timeout_ms: uint (60_000)
+    /// Socket write timeout in milliseconds.
+    + write_timeout_ms: uint (5_000)
+    /// Advertise gzip compression support in `grpc-accept-encoding`.
+    + enable_gzip: bool (true)
+
+    - methods: Map[RegisteredMethod] (.{})
+    - unary_interceptors: Array[UnaryInterceptor] (.{})
+    - stream_interceptors: Array[StreamInterceptor] (.{})
+    - tls_context: ?atomic net.SslServerContext (null)
+    - listener: ?atomic net.TcpServer (null)
+    - connections: Array[ServerH2Conn] (.{})
+    - active_streams: uint (0)
+    - stopping: bool (false)
+
+    /// Creates a new `GrpcServer` bound to `host` and `port` on `bind()` / `start()`.
+    + static fn new(host: String ("127.0.0.1"), port: u16 (50051)) SELF {
+        return SELF {
+            host: host
+            port: port
+        }
+    }
+
+    /// Enables TLS with HTTP/2 ALPN (`h2`) using PEM certificate and key files.
+    + fn tls(cert_file: String, key_file: String, min_version: net.TlsVersion (net.TlsVersion.tls_1_2)) !GrpcError {
+        let ctx = net.SslServerContext.new(cert_file, key_file, min_version) ! {
+            throw err(.internal, "Failed to load TLS certificate/key")
+        }
+        enable_h2_server_alpn(ctx)
+        this.tls_context = ctx
+    }
+
+    /// Configures mutual TLS client certificate verification against `ca_file`.
+    + fn tls_client_ca(ca_file: String, required: bool (true)) !GrpcError {
+        let ctx = this.tls_context ?! throw err(.failed_precondition, "Call tls() before tls_client_ca()")
+        ctx.set_client_ca(ca_file, required) ! throw err(.internal, "Failed to load TLS client CA")
+    }
+
+    /// Registers a unary RPC handler for `method` (e.g. `"/pkg.Service/Method"`).
+    + fn register_unary(method: String, handler: UnaryHandler) {
+        this.methods.set(normalize_method_path(method), RegisteredMethod {
+            kind: .unary
+            unary_handler: handler
+        })
+    }
+
+    /// Registers a server-streaming RPC handler for `method`.
+    + fn register_server_stream(method: String, handler: ServerStreamHandler) {
+        this.methods.set(normalize_method_path(method), RegisteredMethod {
+            kind: .server_stream
+            server_stream_handler: handler
+        })
+    }
+
+    /// Registers a client-streaming RPC handler for `method`.
+    + fn register_client_stream(method: String, handler: ClientStreamHandler) {
+        this.methods.set(normalize_method_path(method), RegisteredMethod {
+            kind: .client_stream
+            client_stream_handler: handler
+        })
+    }
+
+    /// Registers a bidirectional streaming RPC handler for `method`.
+    + fn register_bidi_stream(method: String, handler: BidiStreamHandler) {
+        this.methods.set(normalize_method_path(method), RegisteredMethod {
+            kind: .bidi_stream
+            bidi_stream_handler: handler
+        })
+    }
+
+    /// Adds a unary interceptor (first added runs outermost).
+    + fn add_unary_interceptor(interceptor: UnaryInterceptor) {
+        this.unary_interceptors.append(interceptor)
+    }
+
+    /// Adds a stream interceptor (first added runs outermost).
+    + fn add_stream_interceptor(interceptor: StreamInterceptor) {
+        this.stream_interceptors.append(interceptor)
+    }
+
+    /// Binds the TCP listening socket and returns the actual bound port.
+    + fn bind() u16 !GrpcError {
+        if isset(this.listener) : return this.bound_port
+        let sock = net.TcpServer.new(this.host, this.port, 5000, false) ! {
+            throw err(.unavailable, "Failed to bind gRPC server on %{this.host}:%{this.port}")
+        }
+        let bp = this.port
+        if bp == 0 {
+            let addr = sock.local_address() !? net.SocketAddress {}
+            bp = addr.port
+        }
+        this.listener = sock
+        this.bound_port = bp
+        return bp
+    }
+
+    /// Binds (if not already bound) and serves incoming HTTP/2 gRPC connections until `shutdown()`.
+    + fn start() !GrpcError {
+        this.bind() !>
+        let sock = this.listener ?! throw err(.internal, "Server listener not initialized")
+        while !this.stopping {
+            let con = sock.accept(100) ! {
+                if E == .io(.timeout) : continue
+                if this.stopping : break
+                continue
+            }
+            if this.stopping {
+                con.close() ! {}
+                break
+            }
+            co this.serve_connection(con)
+        }
+    }
+
+    /// Gracefully shuts down the server: stops accepting new connections, sends HTTP/2 `GOAWAY`,
+    /// waits up to `timeout_ms` for in-flight RPCs to drain, and closes remaining connections.
+    + fn shutdown(timeout_ms: uint (5000)) {
+        if this.stopping : return
+        this.stopping = true
+        let sock = this.listener
+        if isset(sock) {
+            sock.close() ! {}
+            this.listener = null
+        }
+        let conns = this.connections.copy()
+        each conns as c {
+            c.initiate_goaway()
+        }
+        let deadline = time.mono_ms() + timeout_ms
+        while (this.active_streams > 0 || this.connections.length > 0) && time.mono_ms() < deadline {
+            time.sleep_ms(5)
+        }
+        let remaining = this.connections.copy()
+        each remaining as c {
+            c.close()
+        }
+    }
+
+    fn serve_connection(con: net.TcpConnection) {
+        let tls_ctx = this.tls_context
+        if isset(tls_ctx) {
+            con.ssl_accept(tls_ctx, 5000) ! {
+                con.close() ! {}
+                return
+            }
+            let ssl = con.ssl
+            if !isset(ssl) || ssl.selected_alpn() != "h2" {
+                con.close() ! {}
+                return
+            }
+        }
+        let peer_addr = con.peer_address() !? net.SocketAddress {}
+        let peer_str = peer_addr.ip()
+        let h2c = ServerH2Conn {
+            server: this
+            con: con
+            peer_address: peer_str
+            last_activity_ms: time.mono_ms()
+        }
+        h2c.decoder.max_header_size = this.max_header_list_size
+        h2c.assembler.max_size = this.max_header_list_size
+        this.connections.append(h2c)
+        h2c.run()
+        this.remove_connection(h2c)
+    }
+
+    fn remove_connection(target: ServerH2Conn) {
+        let i = this.connections.length
+        while i > 0 {
+            i--
+            let c = this.connections.get(i) ! continue
+            if c == target {
+                this.connections.remove(i)
+                return
+            }
+        }
+    }
+
+    fn build_unary_chain(base: UnaryHandler) UnaryHandler {
+        let chain = base
+        let i = this.unary_interceptors.length
+        while i > 0 {
+            i--
+            let ic = this.unary_interceptors.get(i) ! break
+            chain = wrap_unary_interceptor(ic, chain)
+        }
+        return chain
+    }
+
+    fn build_stream_chain(base: BidiStreamHandler) BidiStreamHandler {
+        let chain = base
+        let i = this.stream_interceptors.length
+        while i > 0 {
+            i--
+            let ic = this.stream_interceptors.get(i) ! break
+            chain = wrap_stream_interceptor(ic, chain)
+        }
+        return chain
+    }
+}
+
+fn normalize_method_path(method: String) String {
+    if method.starts_with("/") : return method
+    return "/" + method
+}
+
+fn wrap_unary_interceptor(ic: UnaryInterceptor, next: UnaryHandler) UnaryHandler {
+    return fn(ctx: CallContext, req: String) String !GrpcError {
+        return ic(ctx, req, next) !>
+    }
+}
+
+fn wrap_stream_interceptor(ic: StreamInterceptor, next: BidiStreamHandler) BidiStreamHandler {
+    return fn(stream: ServerStream) void !GrpcError {
+        ic(stream, next) !>
+    }
+}
+
+class ServerH2Conn {
+    server: GrpcServer
+    con: net.TcpConnection
+    peer_address: String ("")
+    closed: bool (false)
+    draining: bool (false)
+    last_stream_id: u32 (0)
+    peer_settings: H2Settings (.{})
+    decoder: HpackDecoder (.{})
+    encoder: HpackEncoder (.{})
+    assembler: H2HeaderAssembler (.{})
+    streams: HashMap[u32, ServerStream] (.new())
+    recv_buf: ByteBuffer (.new(16_384))
+    send_window: int (H2_DEFAULT_WINDOW)
+    conn_recv_window: int (H2_TARGET_WINDOW)
+    conn_unacked_recv: uint (0)
+    last_activity_ms: uint (0)
+    write_busy: bool (false)
+    write_waiters: Array[sync.Waker] (.{})
+    window_waiters: Array[sync.Waker] (.{})
+
+    fn lock_write() {
+        while this.write_busy {
+            let w = sync.Waker.new() ! {
+                time.sleep_ms(1)
+                continue
+            }
+            this.write_waiters.append(w)
+            w.wait()
+        }
+        this.write_busy = true
+    }
+
+    fn unlock_write() {
+        this.write_busy = false
+        if this.write_waiters.length > 0 {
+            let w = this.write_waiters.pop_first() ! return
+            w.wake()
+        }
+    }
+
+    fn write_bytes(data: local &[u8]) !GrpcError {
+        this.lock_write()
+        defer this.unlock_write()
+        if this.closed : throw err(.unavailable, "Connection closed")
+        this.con.write_timeout_ms = this.server.write_timeout_ms
+        let view = data
+        while view.length > 0 {
+            let n = this.con.write(view) ! {
+                this.close()
+                throw err(.unavailable, "Failed writing HTTP/2 frame")
+            }
+            if n == 0 || n > view.length {
+                this.close()
+                throw err(.unavailable, "Short HTTP/2 write")
+            }
+            view = view.view(n, view.length - n)
+        }
+        this.last_activity_ms = time.mono_ms()
+    }
+
+    fn wake_window_waiters() {
+        while this.window_waiters.length > 0 {
+            let w = this.window_waiters.pop_first() ! break
+            w.wake()
+        }
+    }
+
+    fn initiate_goaway() {
+        if this.closed || this.draining : return
+        this.draining = true
+        let out = ByteBuffer.new(17)
+        h2_encode_goaway(out, this.last_stream_id, H2_ERR_NO_ERROR)
+        this.write_bytes(out.view()) ! {}
+        if this.streams.length == 0 : this.close()
+    }
+
+    fn close() {
+        if this.closed : return
+        this.closed = true
+        let list = Array[ServerStream].new()
+        each this.streams as st : list.append(st)
+        this.streams.clear()
+        each list as st {
+            st.cancelled = true
+            st.wake_window_waiters()
+            st.waker.wake()
+        }
+        this.wake_window_waiters()
+        this.con.close() ! {}
+    }
+
+    fn run() {
+        // 1. Read client HTTP/2 connection preface
+        this.con.read_timeout_ms = 5_000
+        while this.recv_buf.length < H2_PREFACE.bytes && !this.closed {
+            this.recv_buf.reserve(4096)
+            let n = this.con.read(this.recv_buf.view_spare(4096)) ! {
+                this.close()
+                return
+            }
+            if n == 0 {
+                this.close()
+                return
+            }
+            this.recv_buf.skip(n)
+        }
+        if !this.recv_buf.view(0, H2_PREFACE.bytes).equals(H2_PREFACE) {
+            this.close()
+            return
+        }
+        this.recv_buf.clear_until(H2_PREFACE.bytes)
+
+        // 2. Send server initial SETTINGS + connection WINDOW_UPDATE
+        let init_out = ByteBuffer.new(64)
+        h2_encode_initial_settings(init_out, this.server.max_concurrent_streams, H2_TARGET_WINDOW, H2_DEFAULT_MAX_FRAME_SIZE, false)
+        this.write_bytes(init_out.view()) ! {
+            this.close()
+            return
+        }
+
+        // 3. Main frame read loop
+        while !this.closed {
+            this.process_frames() ! {
+                let out = ByteBuffer.new(17)
+                h2_encode_goaway(out, this.last_stream_id, H2_ERR_PROTOCOL)
+                this.write_bytes(out.view()) ! {}
+                this.close()
+                return
+            }
+            if this.closed : break
+            if this.draining && this.streams.length == 0 {
+                this.close()
+                break
+            }
+
+            this.con.read_timeout_ms = 200
+            this.recv_buf.reserve(16_393)
+            let n = this.con.read(this.recv_buf.view_spare(16_393)) ! {
+                if this.closed : break
+                if E == .timeout {
+                    if this.draining && this.streams.length == 0 {
+                        this.close()
+                        break
+                    }
+                    let idle = this.server.idle_timeout_ms
+                    if idle > 0 && this.streams.length == 0 && time.mono_ms() - this.last_activity_ms >= idle {
+                        this.initiate_goaway()
+                        break
+                    }
+                    continue
+                }
+                this.close()
+                break
+            }
+            if n == 0 {
+                this.close()
+                break
+            }
+            this.last_activity_ms = time.mono_ms()
+            this.recv_buf.skip(n)
+        }
+        this.close()
+    }
+
+    fn process_frames() !GrpcError {
+        while !this.closed {
+            let frame = (h2_try_read_frame(this.recv_buf, H2_DEFAULT_MAX_FRAME_SIZE) !>) ?! break
+            this.handle_frame(frame) !>
+        }
+        if this.recv_buf.length == 0 && this.recv_buf.size > 65_536 {
+            this.recv_buf.shrink_capacity(16_384)
+        }
+    }
+
+    fn handle_frame(frame: H2Frame) !GrpcError {
+        if this.assembler.stream != 0 {
+            if frame.kind != H2_CONTINUATION || frame.stream != this.assembler.stream {
+                throw err(.internal, "Expected CONTINUATION frame")
+            }
+        } else if frame.kind == H2_CONTINUATION {
+            throw err(.internal, "Unexpected CONTINUATION frame")
+        }
+
+        if frame.kind == H2_SETTINGS {
+            if (frame.flags & H2_FLAG_ACK) != 0 : return
+            let old_win = this.peer_settings.initial_window_size.to(int)
+            this.peer_settings.apply(frame.payload) !>
+            let new_win = this.peer_settings.initial_window_size.to(int)
+            let delta = new_win - old_win
+            if delta != 0 {
+                each this.streams as st {
+                    st.send_window += delta
+                    if delta > 0 : st.wake_window_waiters()
+                }
+            }
+            let ack = ByteBuffer.new(9)
+            h2_encode_settings_ack(ack)
+            this.write_bytes(ack.view()) ! {}
+            return
+        }
+
+        if frame.kind == H2_PING {
+            if frame.payload.bytes != 8 : throw err(.internal, "Invalid PING payload length")
+            if (frame.flags & H2_FLAG_ACK) != 0 : return
+            let pong = ByteBuffer.new(17)
+            h2_encode_ping(pong, frame.payload, true)
+            this.write_bytes(pong.view()) ! {}
+            return
+        }
+
+        if frame.kind == H2_WINDOW_UPDATE {
+            if frame.payload.bytes != 4 : throw err(.internal, "Invalid WINDOW_UPDATE length")
+            let inc = (h2_read_u32_be(frame.payload, 0) & 0x7fffffff).to(int)
+            if inc <= 0 : throw err(.internal, "Zero WINDOW_UPDATE increment")
+            if frame.stream == 0 {
+                this.send_window += inc
+                this.wake_window_waiters()
+            } else {
+                let st = this.streams.get(frame.stream) !? null
+                if isset(st) {
+                    st.send_window += inc
+                    st.wake_window_waiters()
+                }
+            }
+            return
+        }
+
+        if frame.kind == H2_PRIORITY : return
+
+        if frame.kind == H2_GOAWAY {
+            this.draining = true
+            return
+        }
+
+        if frame.kind == H2_RST_STREAM {
+            let st = this.streams.get(frame.stream) !? null
+            if isset(st) {
+                st.cancelled = true
+                st.wake_window_waiters()
+                st.waker.wake()
+                this.streams.remove(frame.stream)
+            }
+            return
+        }
+
+        if frame.kind == H2_HEADERS || frame.kind == H2_CONTINUATION {
+            let stream_id = frame.stream
+            let block = (this.assembler.accept(frame) !>) ?! return
+            let end_stream = this.assembler.end_stream
+            let fields = this.decoder.decode(block) !>
+
+            if this.streams.has(stream_id) {
+                // Request trailers (ignored in gRPC beyond END_STREAM)
+                if end_stream {
+                    let st = this.streams.get(stream_id) !? null
+                    if isset(st) {
+                        st.remote_eof = true
+                        st.waker.wake()
+                    }
+                }
+                return
+            }
+
+            if stream_id == 0 || stream_id % 2 == 0 || stream_id <= this.last_stream_id {
+                throw err(.internal, "Invalid HTTP/2 stream ID")
+            }
+            this.last_stream_id = stream_id
+
+            if this.draining || this.streams.length >= this.server.max_concurrent_streams {
+                let out = ByteBuffer.new(13)
+                h2_encode_rst_stream(out, stream_id, H2_ERR_REFUSED_STREAM)
+                this.write_bytes(out.view()) ! {}
+                return
+            }
+
+            this.start_rpc_stream(stream_id, fields, end_stream)
+            return
+        }
+
+        if frame.kind == H2_DATA {
+            let flow_len = frame.payload.bytes
+            this.conn_recv_window -= flow_len.to(int)
+            this.conn_unacked_recv += flow_len
+            let st = this.streams.get(frame.stream) !? null
+            if !isset(st) {
+                this.maybe_send_conn_window_update()
+                return
+            }
+            st.recv_window -= flow_len.to(int)
+            st.unacked_recv += flow_len
+
+            let data = frame.fragment() !>
+            if data.bytes > 0 : st.decoder.push(data)
+            if (frame.flags & H2_FLAG_END_STREAM) != 0 : st.remote_eof = true
+            st.waker.wake()
+
+            if !st.remote_eof : this.maybe_send_stream_window_update(st)
+            this.maybe_send_conn_window_update()
+            return
+        }
+    }
+
+    fn maybe_send_conn_window_update() {
+        let inc = this.conn_unacked_recv
+        if inc < H2_TARGET_WINDOW / 2 : return
+        this.conn_unacked_recv = 0
+        this.conn_recv_window += inc.to(int)
+        let out = ByteBuffer.new(13)
+        h2_encode_window_update(out, 0, inc.to(u32))
+        this.write_bytes(out.view()) ! {}
+    }
+
+    fn maybe_send_stream_window_update(st: ServerStream) {
+        let inc = st.unacked_recv
+        if inc < H2_TARGET_WINDOW / 2 : return
+        st.unacked_recv = 0
+        st.recv_window += inc.to(int)
+        let out = ByteBuffer.new(13)
+        h2_encode_window_update(out, st.stream_id, inc.to(u32))
+        this.write_bytes(out.view()) ! {}
+    }
+
+    fn start_rpc_stream(stream_id: u32, fields: Array[HeaderField], end_stream: bool) {
+        let method = ""
+        let path = ""
+        let authority = ""
+        let content_type = ""
+        let grpc_encoding = ""
+        let grpc_accept_encoding = ""
+        let grpc_timeout = ""
+        let md = Metadata.new()
+
+        each fields as f {
+            if f.name == ":method" : method = f.value
+            else if f.name == ":path" : path = f.value
+            else if f.name == ":authority" : authority = f.value
+            else if f.name == "content-type" : content_type = f.value
+            else if f.name == "grpc-encoding" : grpc_encoding = f.value
+            else if f.name == "grpc-accept-encoding" : grpc_accept_encoding = f.value
+            else if f.name == "grpc-timeout" : grpc_timeout = f.value
+            else if !is_reserved_transport_header(f.name) : md.append(f.name, f.value)
+        }
+
+        if method != "POST" {
+            this.send_http_error(stream_id, "405")
+            return
+        }
+        if !content_type.starts_with("application/grpc") {
+            this.send_http_error(stream_id, "415")
+            return
+        }
+
+        let waker = sync.Waker.new() ! {
+            this.send_trailers_only_error(stream_id, err(.internal, "Failed to allocate stream waker"))
+            return
+        }
+
+        let req_comp = Compression.identity
+        if grpc_encoding.bytes > 0 {
+            req_comp = compression_from_name(grpc_encoding) ! {
+                this.send_trailers_only_error(stream_id, E, true)
+                return
+            }
+            if req_comp == .gzip && !this.server.enable_gzip {
+                this.send_trailers_only_error(stream_id, err(.unimplemented, "gzip compression disabled on server"), true)
+                return
+            }
+        }
+
+        let deadline_ms: uint = 0
+        if grpc_timeout.bytes > 0 {
+            let ms = parse_timeout_ms(grpc_timeout) ! {
+                this.send_trailers_only_error(stream_id, E)
+                return
+            }
+            deadline_ms = time.mono_ms() + ms
+        }
+
+        let ctx = CallContext {
+            method: path
+            authority: authority
+            metadata: md
+            deadline_ms: deadline_ms
+            peer_address: this.peer_address
+            client_accepts_gzip: accepts_gzip(grpc_accept_encoding)
+        }
+
+        let st = ServerStream {
+            ctx: ctx
+            conn: this
+            stream_id: stream_id
+            waker: waker
+            decoder: FrameDecoder.new(req_comp, this.server.max_recv_message_size)
+            send_window: this.peer_settings.initial_window_size.to(int)
+            remote_eof: end_stream
+            max_send_size: this.server.max_send_message_size
+        }
+        this.streams.set(stream_id, st)
+        this.server.active_streams++
+        co this.dispatch_stream(st)
+    }
+
+    fn dispatch_stream(st: ServerStream) {
+        defer {
+            st.finished = true
+            this.streams.remove(st.stream_id)
+            if this.server.active_streams > 0 : this.server.active_streams--
+        }
+
+        let reg = this.server.methods.get(st.ctx.method) !? null
+        if !isset(reg) {
+            this.finish_stream(st, err(.unimplemented, "Unknown method %{st.ctx.method}"))
+            return
+        }
+
+        if st.ctx.is_expired() {
+            this.finish_stream(st, err(.deadline_exceeded, "RPC deadline exceeded"))
+            return
+        }
+
+        if reg.kind == .unary {
+            let handler = reg.unary_handler ?! {
+                this.finish_stream(st, err(.unimplemented, "Missing unary handler"))
+                return
+            }
+            let req_opt = st.recv() ! {
+                this.finish_stream(st, E)
+                return
+            }
+            let req_bytes = req_opt ?? ""
+            let chain = this.server.build_unary_chain(handler)
+            let resp_bytes = chain(st.ctx, req_bytes) ! {
+                this.finish_stream(st, E)
+                return
+            }
+            if st.ctx.is_expired() {
+                this.finish_stream(st, err(.deadline_exceeded, "RPC deadline exceeded"))
+                return
+            }
+            st.send(resp_bytes) ! {
+                this.finish_stream(st, E)
+                return
+            }
+            this.finish_stream(st, null)
+            return
+        }
+
+        if reg.kind == .server_stream {
+            let handler = reg.server_stream_handler ?! {
+                this.finish_stream(st, err(.unimplemented, "Missing server stream handler"))
+                return
+            }
+            let req_opt = st.recv() ! {
+                this.finish_stream(st, E)
+                return
+            }
+            let req_bytes = req_opt ?? ""
+            let base: BidiStreamHandler = fn(s: ServerStream) void !GrpcError {
+                handler(s.ctx, req_bytes, s) !>
+            }
+            let chain = this.server.build_stream_chain(base)
+            chain(st) ! {
+                this.finish_stream(st, E)
+                return
+            }
+            this.finish_stream(st, null)
+            return
+        }
+
+        if reg.kind == .client_stream {
+            let handler = reg.client_stream_handler ?! {
+                this.finish_stream(st, err(.unimplemented, "Missing client stream handler"))
+                return
+            }
+            let base: BidiStreamHandler = fn(s: ServerStream) void !GrpcError {
+                let resp_bytes = handler(s) !>
+                s.send(resp_bytes) !>
+            }
+            let chain = this.server.build_stream_chain(base)
+            chain(st) ! {
+                this.finish_stream(st, E)
+                return
+            }
+            this.finish_stream(st, null)
+            return
+        }
+
+        // Bidi stream
+        let handler = reg.bidi_stream_handler ?! {
+            this.finish_stream(st, err(.unimplemented, "Missing bidi stream handler"))
+            return
+        }
+        let chain = this.server.build_stream_chain(handler)
+        chain(st) ! {
+            this.finish_stream(st, E)
+            return
+        }
+        this.finish_stream(st, null)
+    }
+
+    fn send_response_headers(st: ServerStream, end_stream: bool) !GrpcError {
+        if st.headers_sent : return
+        st.headers_sent = true
+        let fields = Array[HeaderField] {
+            .{ name: ":status", value: "200" },
+            .{ name: "content-type", value: "application/grpc" },
+        }
+        if this.server.enable_gzip {
+            fields.append(.{ name: "grpc-accept-encoding", value: "identity,gzip" })
+        } else {
+            fields.append(.{ name: "grpc-accept-encoding", value: "identity" })
+        }
+        let comp = st.effective_compression()
+        if comp != .identity {
+            fields.append(.{ name: "grpc-encoding", value: compression_name(comp) })
+        }
+        each st.ctx.response_headers as val, key {
+            if is_valid_metadata_key(key) && !is_reserved_transport_header(key) {
+                fields.append(.{ name: key, value: val, never_index: true })
+            }
+        }
+        let block = this.encoder.encode(fields)
+        let out = ByteBuffer.new(block.bytes + 32)
+        h2_encode_headers(out, st.stream_id, block, end_stream, this.peer_settings.max_frame_size)
+        this.write_bytes(out.view()) !>
+    }
+
+    fn send_stream_data(st: ServerStream, data: local &[u8]) !GrpcError {
+        let pos: uint = 0
+        while pos < data.length {
+            while !this.closed && !st.cancelled && (this.send_window <= 0 || st.send_window <= 0) {
+                let wait_ms: uint = this.server.write_timeout_ms
+                if st.ctx.deadline_ms > 0 {
+                    let rem = st.ctx.remaining_ms()
+                    if rem == 0 : throw err(.deadline_exceeded, "RPC deadline exceeded")
+                    if wait_ms == 0 || rem < wait_ms : wait_ms = rem
+                }
+                let w = sync.Waker.new() ! throw err(.internal, "Failed to allocate flow-control waker")
+                if this.send_window <= 0 {
+                    this.window_waiters.append(w)
+                } else {
+                    st.send_window_waiters.append(w)
+                }
+                if !w.wait(wait_ms) {
+                    if st.ctx.is_expired() : throw err(.deadline_exceeded, "RPC deadline exceeded")
+                    if this.send_window <= 0 || st.send_window <= 0 {
+                        throw err(.deadline_exceeded, "Flow-control send timeout")
+                    }
+                }
+            }
+            if this.closed || st.cancelled : throw err(.cancelled, "Stream closed while sending")
+
+            let avail_conn = this.send_window.to(uint)
+            let avail_stream = st.send_window.to(uint)
+            let max_frame = this.peer_settings.max_frame_size.to(uint)
+            if max_frame < H2_DEFAULT_MAX_FRAME_SIZE : max_frame = H2_DEFAULT_MAX_FRAME_SIZE
+            let chunk = data.length - pos
+            if chunk > max_frame : chunk = max_frame
+            if chunk > avail_conn : chunk = avail_conn
+            if chunk > avail_stream : chunk = avail_stream
+
+            let out = ByteBuffer.new(chunk + 9)
+            h2_encode_frame(out, H2_DATA, 0, st.stream_id, data.view(pos, chunk))
+            this.send_window -= chunk.to(int)
+            st.send_window -= chunk.to(int)
+            this.write_bytes(out.view()) !>
+            pos += chunk
+        }
+    }
+
+    fn finish_stream(st: ServerStream, error: ?GrpcError) {
+        if this.closed || st.cancelled : return
+        let status_code = isset(error) ? error.code.to(i32) : 0
+        let msg = isset(error) ? error.message : ""
+        let det = isset(error) ? error.details : ""
+
+        let fields = Array[HeaderField].new(6)
+        if !st.headers_sent {
+            // Trailers-only response: single HEADERS frame with END_STREAM
+            st.headers_sent = true
+            fields.append(.{ name: ":status", value: "200" })
+            fields.append(.{ name: "content-type", value: "application/grpc" })
+            if this.server.enable_gzip {
+                fields.append(.{ name: "grpc-accept-encoding", value: "identity,gzip" })
+            }
+            each st.ctx.response_headers as val, key {
+                if is_valid_metadata_key(key) && !is_reserved_transport_header(key) {
+                    fields.append(.{ name: key, value: val, never_index: true })
+                }
+            }
+        }
+        fields.append(.{ name: "grpc-status", value: status_code.to_string(), never_index: true })
+        if msg.bytes > 0 {
+            fields.append(.{ name: "grpc-message", value: percent_encode(msg), never_index: true })
+        }
+        if det.bytes > 0 {
+            fields.append(.{ name: "grpc-status-details-bin", value: crypto.base64_encode(det), never_index: true })
+        }
+        each st.ctx.response_trailers as val, key {
+            if is_valid_metadata_key(key) && !is_reserved_transport_header(key) {
+                fields.append(.{ name: key, value: val, never_index: true })
+            }
+        }
+        let block = this.encoder.encode(fields)
+        let out = ByteBuffer.new(block.bytes + 32)
+        h2_encode_headers(out, st.stream_id, block, true, this.peer_settings.max_frame_size)
+        this.write_bytes(out.view()) ! {}
+    }
+
+    fn send_trailers_only_error(stream_id: u32, error: GrpcError, include_accept_encoding: bool (false)) {
+        if this.closed : return
+        let fields = Array[HeaderField] {
+            .{ name: ":status", value: "200" },
+            .{ name: "content-type", value: "application/grpc" },
+        }
+        if include_accept_encoding {
+            fields.append(.{ name: "grpc-accept-encoding", value: this.server.enable_gzip ? "identity,gzip" : "identity" })
+        }
+        fields.append(.{ name: "grpc-status", value: error.code.to(i32).to_string(), never_index: true })
+        if error.message.bytes > 0 {
+            fields.append(.{ name: "grpc-message", value: percent_encode(error.message), never_index: true })
+        }
+        let block = this.encoder.encode(fields)
+        let out = ByteBuffer.new(block.bytes + 32)
+        h2_encode_headers(out, stream_id, block, true, this.peer_settings.max_frame_size)
+        this.write_bytes(out.view()) ! {}
+    }
+
+    fn send_http_error(stream_id: u32, status_str: String) {
+        if this.closed : return
+        let fields = Array[HeaderField] {
+            .{ name: ":status", value: status_str },
+        }
+        let block = this.encoder.encode(fields)
+        let out = ByteBuffer.new(block.bytes + 16)
+        h2_encode_headers(out, stream_id, block, true, this.peer_settings.max_frame_size)
+        this.write_bytes(out.view()) ! {}
+    }
+}

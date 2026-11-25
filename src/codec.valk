@@ -1,0 +1,100 @@
+/// Encodes any `valk-protobuf` message (`T` with `to_proto_bytes() String`) to wire bytes.
++ fn encode_proto[T](msg: T) String {
+    return msg.to_proto_bytes()
+}
+
+/// Decodes wire bytes into a `valk-protobuf` message (`T` with `static fn decode_proto`).
++ fn decode_proto[T](data: local &[u8]) T !GrpcError {
+    return T.decode_proto(data) ! throw err(.internal, "Protobuf decode error: %{E.message}")
+}
+
+/// Typed wrapper over `ServerStream` for `valk-protobuf` request/response messages.
++ class TypedServerStream[Req, Res] {
+    + raw: ServerStream
+
+    + static fn new(raw: ServerStream) SELF {
+        return SELF { raw: raw }
+    }
+
+    /// Returns the call context (metadata, deadline, response headers/trailers).
+    + fn context() CallContext {
+        return this.raw.ctx
+    }
+
+    /// Receives and decodes the next `Req` message, or `null` at client EOF.
+    + fn recv() ?Req !GrpcError {
+        let bytes = (this.raw.recv() !>) ?! return null
+        return Req.decode_proto(bytes) ! throw err(.invalid_argument, "Invalid request message: %{E.message}")
+    }
+
+    /// Encodes and sends a `Res` message to the client.
+    + fn send(msg: Res) !GrpcError {
+        this.raw.send(msg.to_proto_bytes()) !>
+    }
+
+    /// Explicitly sends initial response headers before sending messages.
+    + fn send_header(headers: ?Metadata (null)) !GrpcError {
+        this.raw.send_header(headers) !>
+    }
+
+    /// Sets a response trailer.
+    + fn set_trailer(key: String, value: String) {
+        this.raw.set_trailer(key, value)
+    }
+
+    /// Returns the response trailers collection.
+    + fn trailers() Metadata {
+        return this.raw.trailers()
+    }
+
+    /// Returns true if the stream was cancelled or the connection closed.
+    + fn is_cancelled() bool {
+        return this.raw.is_cancelled()
+    }
+}
+
+/// Typed wrapper over `ClientStream` for `valk-protobuf` request/response messages.
++ class TypedClientStream[Req, Res] {
+    + raw: ClientStream
+
+    + static fn new(raw: ClientStream) SELF {
+        return SELF { raw: raw }
+    }
+
+    /// Encodes and sends a `Req` message to the server.
+    + fn send(msg: Req) !GrpcError {
+        this.raw.send(msg.to_proto_bytes()) !>
+    }
+
+    /// Half-closes the client send direction (`END_STREAM`).
+    + fn close_send() !GrpcError {
+        this.raw.close_send() !>
+    }
+
+    /// Receives and decodes the next `Res` message, or `null` on clean OK EOF.
+    + fn recv() ?Res !GrpcError {
+        let bytes = (this.raw.recv() !>) ?! return null
+        return decode_proto[Res](bytes) !>
+    }
+
+    /// Closes send side and reads the single `Res` message (for client-streaming RPCs).
+    + fn finish() Res !GrpcError {
+        let body, _ = this.raw.finish() !>
+        return decode_proto[Res](body) !>
+    }
+
+    /// Waits for and returns initial response headers.
+    + fn headers() Metadata !GrpcError {
+        return this.raw.headers() !>
+    }
+
+    /// Returns response trailers after stream completion.
+    + fn trailers() Metadata {
+        return this.raw.trailers()
+    }
+
+    /// Cancels the stream.
+    + fn cancel() {
+        this.raw.cancel()
+    }
+}
