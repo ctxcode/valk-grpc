@@ -266,7 +266,7 @@ use valk.crypto
                 con.close() ! {}
                 throw err(.unavailable, "TLS handshake failed for %{host}:%{port}")
             }
-            if ssl.selected_alpn() != "h2" {
+            if (ssl.selected_alpn() ?? "") != "h2" {
                 con.close() ! {}
                 throw err(.unavailable, "Server did not negotiate ALPN h2")
             }

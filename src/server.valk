@@ -219,7 +219,7 @@ class RegisteredMethod {
     /// Binds the TCP listening socket and returns the actual bound port.
     + fn bind() u16 !GrpcError {
         if isset(this.listener) : return this.bound_port
-        let sock = net.TcpServer.new(this.host, this.port, 5000, false) ! {
+        let sock = net.TcpServer.new(this.host, this.port, false, 5000) ! {
             throw err(.unavailable, "Failed to bind gRPC server on %{this.host}:%{this.port}")
         }
         let bp = this.port
@@ -282,7 +282,7 @@ class RegisteredMethod {
                 return
             }
             let ssl = con.ssl
-            if !isset(ssl) || ssl.selected_alpn() != "h2" {
+            if !isset(ssl) || (ssl.selected_alpn() ?? "") != "h2" {
                 con.close() ! {}
                 return
             }
