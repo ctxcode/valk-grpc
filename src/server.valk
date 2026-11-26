@@ -1,3 +1,4 @@
+use valk.http
 use valk.net
 use valk.sync
 use valk.time
@@ -314,6 +315,119 @@ class RegisteredMethod {
         }
     }
 
+    /// Handles a unary gRPC request received through `valk.http.Server`, sharing its
+    /// HTTP/2 listener alongside regular HTTP/WebSocket routes.
+    ///
+    /// Applies standard gRPC framing, compression, metadata, deadlines, unary interceptors,
+    /// and status/trailer encoding. Streaming RPCs require `GrpcServer.start()`.
+    + fn handle_http(req: http.Request) http.Response {
+        if req.method != "POST" : return http.Response.empty(405)
+        let content_type = req.header("content-type") !? ""
+        if !content_type.starts_with("application/grpc") : return http.Response.empty(415)
+
+        let reg = this.methods.get(req.path) !? null
+        if !isset(reg) {
+            return grpc_http_error(err(.unimplemented, "Unknown method %{req.path}"), null, this.enable_gzip, false)
+        }
+        if reg.kind != .unary {
+            return grpc_http_error(err(.unimplemented, "Streaming RPCs require GrpcServer.start()"), null, this.enable_gzip, false)
+        }
+        let handler = reg.unary_handler ?! {
+            return grpc_http_error(err(.unimplemented, "Missing unary handler"), null, this.enable_gzip, false)
+        }
+
+        let req_comp = Compression.identity
+        let grpc_encoding = req.header("grpc-encoding") !? ""
+        if grpc_encoding.bytes > 0 {
+            req_comp = compression_from_name(grpc_encoding) ! {
+                return grpc_http_error(E, null, this.enable_gzip, true)
+            }
+            if req_comp == .gzip && !this.enable_gzip {
+                return grpc_http_error(err(.unimplemented, "gzip compression disabled on server"), null, this.enable_gzip, true)
+            }
+        }
+
+        let deadline_ms: uint = 0
+        let grpc_timeout = req.header("grpc-timeout") !? ""
+        if grpc_timeout.bytes > 0 {
+            let ms = parse_timeout_ms(grpc_timeout) ! {
+                return grpc_http_error(E, null, this.enable_gzip, false)
+            }
+            deadline_ms = time.mono_ms() + ms
+        }
+
+        let md = Metadata.new()
+        let authority = ""
+        let grpc_accept_encoding = ""
+        each req.headers() as val, key {
+            let lower = key.lower()
+            if lower == "host" : authority = val
+            else if lower == "grpc-accept-encoding" : grpc_accept_encoding = val
+            else if lower == "grpc-encoding" || lower == "grpc-timeout" : continue
+            else if !is_reserved_transport_header(lower) : md.append(lower, val)
+        }
+
+        let ctx = CallContext {
+            method: req.path
+            authority: authority
+            metadata: md
+            deadline_ms: deadline_ms
+            peer_address: req.peer_address.port > 0 ? req.peer_address.ip() : ""
+            client_accepts_gzip: accepts_gzip(grpc_accept_encoding)
+        }
+
+        if ctx.is_expired() {
+            return grpc_http_error(err(.deadline_exceeded, "RPC deadline exceeded"), ctx, this.enable_gzip, false)
+        }
+
+        let body = req.body
+        let req_bytes = ""
+        let decoded = decode_frame(body, req_comp, this.max_recv_message_size) ! {
+            return grpc_http_error(E, ctx, this.enable_gzip, false)
+        }
+        if isset(decoded) {
+            let pair = decoded ?! return grpc_http_error(err(.internal, "Truncated gRPC request message"), ctx, this.enable_gzip, false)
+            let payload, consumed = pair
+            if consumed < body.bytes {
+                return grpc_http_error(err(.internal, "Unexpected extra message in unary gRPC request"), ctx, this.enable_gzip, false)
+            }
+            req_bytes = payload
+        } else if body.bytes > 0 {
+            return grpc_http_error(err(.internal, "Truncated gRPC request message"), ctx, this.enable_gzip, false)
+        }
+
+        let chain = this.build_unary_chain(handler)
+        let resp_bytes = chain(ctx, req_bytes) ! {
+            return grpc_http_error(E, ctx, this.enable_gzip, false)
+        }
+        if ctx.is_expired() {
+            return grpc_http_error(err(.deadline_exceeded, "RPC deadline exceeded"), ctx, this.enable_gzip, false)
+        }
+
+        let resp_comp = (ctx.compression == .gzip && ctx.client_accepts_gzip) ? Compression.gzip : Compression.identity
+        let frame = encode_frame(resp_bytes, resp_comp, this.max_send_message_size) ! {
+            return grpc_http_error(E, ctx, this.enable_gzip, false)
+        }
+
+        let res = http.Response.new(frame, 200, "application/grpc")
+        res.set_header("grpc-accept-encoding", this.enable_gzip ? "identity,gzip" : "identity")
+        if resp_comp != .identity {
+            res.set_header("grpc-encoding", compression_name(resp_comp))
+        }
+        each ctx.response_headers as val, key {
+            if is_valid_metadata_key(key) && !is_reserved_transport_header(key) {
+                res.add_header(key, val)
+            }
+        }
+        res.set_trailer("grpc-status", "0")
+        each ctx.response_trailers as val, key {
+            if is_valid_metadata_key(key) && !is_reserved_transport_header(key) {
+                res.add_trailer(key, val)
+            }
+        }
+        return res
+    }
+
     fn build_unary_chain(base: UnaryHandler) UnaryHandler {
         let chain = base
         let i = this.unary_interceptors.length
@@ -335,6 +449,35 @@ class RegisteredMethod {
         }
         return chain
     }
+}
+
+fn grpc_http_error(error: GrpcError, ctx: ?CallContext, enable_gzip: bool, include_accept_encoding: bool) http.Response {
+    let res = http.Response.new("", 200, "application/grpc")
+    if include_accept_encoding || isset(ctx) {
+        res.set_header("grpc-accept-encoding", enable_gzip ? "identity,gzip" : "identity")
+    }
+    if isset(ctx) {
+        each ctx.response_headers as val, key {
+            if is_valid_metadata_key(key) && !is_reserved_transport_header(key) {
+                res.add_header(key, val)
+            }
+        }
+    }
+    res.set_trailer("grpc-status", error.code.to(i32).to_string())
+    if error.message.bytes > 0 {
+        res.set_trailer("grpc-message", percent_encode(error.message))
+    }
+    if error.details.bytes > 0 {
+        res.set_trailer("grpc-status-details-bin", crypto.base64_encode(error.details))
+    }
+    if isset(ctx) {
+        each ctx.response_trailers as val, key {
+            if is_valid_metadata_key(key) && !is_reserved_transport_header(key) {
+                res.add_trailer(key, val)
+            }
+        }
+    }
+    return res
 }
 
 fn normalize_method_path(method: String) String {

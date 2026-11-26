@@ -1,0 +1,84 @@
+use grpc
+use valk.http
+use valk.time
+
+global http_adapter_grpc: ?grpc.GrpcServer (null)
+
+fn make_http_adapter_grpc() grpc.GrpcServer {
+    let srv = grpc.GrpcServer.new()
+    srv.add_unary_interceptor(fn(ctx: grpc.CallContext, req: String, next: grpc.UnaryHandler) String !grpc.GrpcError {
+        ctx.response_headers.set("x-intercepted", "yes")
+        return next(ctx, req) !>
+    })
+    srv.register_unary("/demo.Echo/Say", fn(ctx: grpc.CallContext, req: String) String !grpc.GrpcError {
+        if req == "boom" {
+            throw grpc.err(.invalid_argument, "bad input")
+        }
+        let tag = ctx.metadata.get("x-tag") ?? ""
+        ctx.response_headers.set("x-tag-echo", tag)
+        ctx.response_trailers.set("x-tail", "done")
+        if req == "zip" : ctx.compression = .gzip
+        return "echo:" + req
+    })
+    return srv
+}
+
+fn http_adapter_handler(req: http.Request) http.Response {
+    if req.path == "/health" : return http.Response.text("ok")
+    let g = http_adapter_grpc ?? <{
+        let created = make_http_adapter_grpc()
+        http_adapter_grpc = created
+        return created
+    }
+    return g.handle_http(req)
+}
+
+test "GrpcServer.handle_http serves unary gRPC alongside regular HTTP on valk.http.Server" {
+    let port: u16 = 29551
+    let srv = http.Server.new("127.0.0.1", port, http_adapter_handler)
+    srv.http2 = true
+    co srv.start(1)
+    time.sleep_ms(80)
+    defer srv.shutdown(2000)
+
+    // Regular HTTP endpoint on same listener
+    let health = http.get("http://127.0.0.1:%{port}/health") ! panic("health failed")
+    assert(health.status == 200 && health.body == "ok")
+
+    // Wrong method -> 405, wrong content-type -> 415
+    let bad_method = http.get("http://127.0.0.1:%{port}/demo.Echo/Say") ! panic("bad_method failed")
+    assert(bad_method.status == 405)
+    let bad_ct = http.post("http://127.0.0.1:%{port}/demo.Echo/Say", "hi") ! panic("bad_ct failed")
+    assert(bad_ct.status == 415)
+
+    // Real gRPC client over h2c
+    let client = grpc.GrpcClient.connect("127.0.0.1:%{port}") ! panic("connect failed: %{E}")
+    defer client.close()
+
+    let opts = grpc.CallOptions {}
+    opts.set_header("x-tag", "alpha")
+    let r1 = client.unary("/demo.Echo/Say", "hello", opts) ! panic("unary failed: %{E}")
+    assert(r1.body == "echo:hello")
+    assert((r1.headers.get("x-intercepted") ?? "") == "yes")
+    assert((r1.headers.get("x-tag-echo") ?? "") == "alpha")
+    assert((r1.trailers.get("x-tail") ?? "") == "done")
+
+    // Gzip request & response compression
+    let zopts = grpc.CallOptions { compression: .gzip }
+    let r2 = client.unary("/demo.Echo/Say", "zip", zopts) ! panic("gzip unary failed: %{E}")
+    assert(r2.body == "echo:zip")
+
+    // Application error propagation
+    let got_invalid = false
+    client.unary("/demo.Echo/Say", "boom") ! {
+        got_invalid = E.code == .invalid_argument && E.message == "bad input"
+    }
+    assert(got_invalid)
+
+    // Unknown method -> UNIMPLEMENTED
+    let got_unimpl = false
+    client.unary("/demo.Echo/Missing", "x") ! {
+        got_unimpl = E.code == .unimplemented
+    }
+    assert(got_unimpl)
+}
