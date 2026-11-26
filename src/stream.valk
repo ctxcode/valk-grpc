@@ -1,3 +1,4 @@
+use valk.http
 use valk.time
 
 /// Per-RPC client call configuration.
@@ -47,22 +48,85 @@ use valk.time
 + class CallContext {
     /// Full gRPC method path (e.g. `"/helloworld.Greeter/SayHello"`).
     + method: String ("")
-    /// Request `:authority` header value.
-    + authority: String ("")
-    /// Incoming request metadata (headers).
-    + metadata: Metadata (.{})
-    /// Initial response metadata sent before the first response message.
-    + response_headers: Metadata (.{})
-    /// Trailing response metadata sent after the response body alongside `grpc-status`.
-    + response_trailers: Metadata (.{})
     /// Monotonic deadline timestamp in milliseconds (0 means no deadline).
     + deadline_ms: uint (0)
-    /// Remote peer address string.
-    + peer_address: String ("")
     /// Compression used for outgoing response messages (falls back to `identity` if client does not accept gzip).
     + compression: Compression (.identity)
+
+    _authority: String ("")
+    _peer_address: String ("")
+    _metadata: ?Metadata (null)
+    _response_headers: ?Metadata (null)
+    _response_trailers: ?Metadata (null)
+    _http_req: ?http.Request (null)
+    _client_accepts_gzip: bool (false)
+    _gzip_checked: bool (false)
+
+    /// Request `:authority` header value.
+    + get authority: String {
+        if this._authority.bytes == 0 {
+            let req = this._http_req
+            if isset(req) : this._authority = req.header("host") !? ""
+        }
+        return this._authority
+    }
+
+    /// Remote peer address string.
+    + get peer_address: String {
+        if this._peer_address.bytes == 0 {
+            let req = this._http_req
+            if isset(req) && req.peer_address.port > 0 : this._peer_address = req.peer_address.ip()
+        }
+        return this._peer_address
+    }
+
     /// Whether the client advertised `gzip` in `grpc-accept-encoding`.
-    + client_accepts_gzip: bool (false)
+    + get client_accepts_gzip: bool {
+        if !this._gzip_checked {
+            this._gzip_checked = true
+            let req = this._http_req
+            if isset(req) {
+                let enc = req.header("grpc-accept-encoding") !? ""
+                if enc.bytes > 0 : this._client_accepts_gzip = accepts_gzip(enc)
+            }
+        }
+        return this._client_accepts_gzip
+    }
+
+    /// Incoming request metadata (headers).
+    + get metadata: Metadata {
+        let md = this._metadata
+        if isset(md) : return md
+        let created = Metadata.new()
+        let req = this._http_req
+        if isset(req) {
+            each req.headers() as val, key {
+                let lower = key.lower()
+                if lower == "host" || lower == "grpc-encoding" || lower == "grpc-accept-encoding" || lower == "grpc-timeout" : continue
+                if !is_reserved_transport_header(lower) : created.append(lower, val)
+            }
+        }
+        this._metadata = created
+        return created
+    }
+
+    /// Initial response metadata sent before the first response message.
+    + get response_headers: Metadata {
+        let md = this._response_headers
+        if isset(md) : return md
+        let created = Metadata.new()
+        this._response_headers = created
+        return created
+    }
+
+    /// Trailing response metadata sent after the response body alongside `grpc-status`.
+    + get response_trailers: Metadata {
+        let md = this._response_trailers
+        if isset(md) : return md
+        let created = Metadata.new()
+        this._response_trailers = created
+        return created
+    }
 
     /// Returns true if this call has a deadline that has already passed.
     + fn is_expired() bool {
@@ -91,6 +155,9 @@ use valk.time
 
 /// Handler for a unary RPC (`/pkg.Service/Method`): one request message, one response message.
 + type UnaryHandler (fn(CallContext, String)(String !GrpcError))
+
+/// Zero-copy unary RPC handler reading request bytes from a slice and writing response bytes into `out`.
++ type UnaryIntoHandler (fn(CallContext, &[u8], ByteBuffer)(void !GrpcError))
 
 /// Handler for a server-streaming RPC: one request message, zero or more streamed responses.
 + type ServerStreamHandler (fn(CallContext, String, ServerStream)(void !GrpcError))

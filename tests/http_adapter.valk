@@ -20,6 +20,10 @@ fn make_http_adapter_grpc() grpc.GrpcServer {
         if req == "zip" : ctx.compression = .gzip
         return "echo:" + req
     })
+    srv.register_unary_into("/demo.Echo/Fast", fn(ctx: grpc.CallContext, req: &[u8], out: ByteBuffer) void !grpc.GrpcError {
+        out.write("fast:")
+        out.write(req)
+    })
     return srv
 }
 
@@ -81,4 +85,39 @@ test "GrpcServer.handle_http serves unary gRPC alongside regular HTTP on valk.ht
         got_unimpl = E.code == .unimplemented
     }
     assert(got_unimpl)
+
+    // Zero-copy register_unary_into fast path (with and without interceptors)
+    let r3 = client.unary("/demo.Echo/Fast", "slice") ! panic("fast unary failed: %{E}")
+    assert(r3.body == "fast:slice")
+    assert((r3.headers.get("x-intercepted") ?? "") == "yes")
+}
+
+global fast_adapter_grpc: ?grpc.GrpcServer (null)
+
+fn fast_adapter_handler(req: http.Request) http.Response {
+    let g = fast_adapter_grpc ?? <{
+        let srv = grpc.GrpcServer.new()
+        srv.register_unary_into("/demo.Fast/Ping", fn(ctx: grpc.CallContext, req: &[u8], out: ByteBuffer) void !grpc.GrpcError {
+            out.write("pong:")
+            out.write(req)
+        })
+        fast_adapter_grpc = srv
+        return srv
+    }
+    return g.handle_http(req)
+}
+
+test "GrpcServer.handle_http zero-copy unary_into fast path without interceptors" {
+    let port: u16 = 29552
+    let srv = http.Server.new("127.0.0.1", port, fast_adapter_handler)
+    srv.http2 = true
+    co srv.start(1)
+    time.sleep_ms(80)
+    defer srv.shutdown(2000)
+
+    let client = grpc.GrpcClient.connect("127.0.0.1:%{port}") ! panic("connect failed: %{E}")
+    defer client.close()
+
+    let r = client.unary("/demo.Fast/Ping", "abc") ! panic("fast ping failed: %{E}")
+    assert(r.body == "pong:abc")
 }
