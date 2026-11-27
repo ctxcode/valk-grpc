@@ -7,7 +7,7 @@ Requires Valk 0.9.2 or newer.
 ## Install
 
 ```
-vman install github.com/ctxcode/valk-grpc
+vman install github.com/zikue/valk-grpc
 ```
 
 ## Features
